@@ -14,6 +14,7 @@ A featherweight proxy that turns WorkBuddy's internal API into a standard **Open
 
 - ✨ **Fully OpenAI-compatible** — `/v1/chat/completions`, `/v1/models`, tools/tool_calls passthrough
 - 🧠 **Reasoning content** — `reasoning_content` (thinking process) exposed
+- 🔁 **Multi-turn reasoning replay** — the upstream drops historical `reasoning_content`, so it is folded into `content` before sending
 - 🚀 **Max thinking by default** — deep reasoning even with zero extra params
 - ⚡ **Streaming by default** — SSE, low latency
 - 🖼️ **Image generation** — text-to-image `/v1/images/generations`, image editing `/v1/images/edits`
@@ -50,7 +51,41 @@ Only two env vars are required:
 | `API_KEY` | ✅ | Key for calling this API |
 | `DEFAULT_MODEL` | ❌ | Default model, default `deepseek-v3` |
 | `DEFAULT_THINKING` | ❌ | Default thinking level, default `max` |
+| `REPLAY_REASONING` | ❌ | Fold historical reasoning into `content` for replay, on by default (set to `0` to disable) |
 | `PORT` | ❌ | Listen port, default `8000` |
+
+> Token resolution order: `CODEBUDDY_AUTH_TOKEN` env var > `--auth-file` > `tokens.json` in the project root > local WorkBuddy auth file.
+> See [tokens.example.json](tokens.example.json) for the `tokens.json` shape (`tokens[].token_info.access_token`);
+> the file is already in `.gitignore` — **never commit a real token**.
+
+## Multi-turn Reasoning Replay
+
+The upstream `/v2/chat/completions` gateway only deserializes whitelisted fields
+(`role` / `content` / `tool_calls`) from `messages`, so `reasoning_content` on
+historical assistant messages is silently dropped:
+
+- Injecting 500 characters of thinking into the previous assistant message adds exactly 0
+  `prompt_tokens` on the next turn;
+- A passphrase planted in the previous turn's thinking is completely invisible to the model.
+
+This proxy therefore folds historical assistant reasoning into `content` before sending, so
+it reaches the base model's Chat Template along with the rest of the history:
+
+```text
+<thinking>
+previous turn reasoning
+</thinking>
+
+previous turn answer
+```
+
+Behavior:
+
+- Only `assistant` messages are touched; `user` / `system` messages pass through untouched
+- Accepts `reasoning_content` / `reasoning` / `thinking` (including Anthropic-style thinking blocks)
+- Idempotent: a `content` that already inlines the same reasoning is not injected twice
+- Non-string `content` (multimodal blocks) is left as-is
+- Set `REPLAY_REASONING=0` if you want downlink-only reasoning without replay
 
 ## Usage Examples
 
@@ -139,6 +174,9 @@ hunyuan-image-v2.0-general-edit           (image-to-image)
 
 > You can also get the full model list anytime via `GET /v1/models`.
 
+> ⚠️ Verified on 2026-09-18: `deepseek-r1-0528`, `deepseek-v3-1`, `glm-4.7` and `glm-5.0` are no longer
+> served upstream (they return `model [...] service info not found`). Use another model instead.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -156,8 +194,25 @@ codebuddy-api-server/
 ├── server.py                 # OpenAI-compatible REST API server
 ├── codebuddy_direct_api.py   # Direct CodeBuddy client (token/SSE/image)
 ├── Dockerfile                # Python 3.11 container
+├── docs/                     # Handoff docs and self-check scripts
 └── README.md
 ```
+
+## Using with Codex
+
+**Codex 0.155.0 only supports the Responses API (`wire_api = "responses"`), while this project only
+exposes `/v1/chat/completions`, so Codex cannot use it directly yet.** See
+[docs/codex-integration.md](docs/codex-integration.md) for the adapter plan and config example.
+
+Any other OpenAI-compatible client (Cherry Studio, Open WebUI, SDKs, scripts) can point its
+`base_url` at this server's `/v1` and work right away.
+
+## Documentation
+
+- [docs/README.md](docs/README.md) — documentation index
+- [Reasoning replay handoff](docs/2026-09-18_reasoning-replay-handoff.md) — root cause, fix, real-upstream verification, todos
+- [Codex integration](docs/codex-integration.md) — limitation, configuration, adapter checklist
+- Self-checks: `python docs/verify_reasoning_replay.py` (offline), `python docs/probe_reasoning_replay.py replay|models` (live)
 
 ---
 

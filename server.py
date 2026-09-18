@@ -72,8 +72,7 @@ MAX_TOKENS_DEFAULT = int(os.environ.get("MAX_TOKENS_DEFAULT", "8192"))
 PORT = int(os.environ.get("PORT", "8000"))
 
 if not CODEBUDDY_AUTH_TOKEN:
-    print("[!] 未设置 CODEBUDDY_AUTH_TOKEN 环境变量", file=sys.stderr)
-    print("[!] 服务器将启动但无法处理请求", file=sys.stderr)
+    print("[i] 未设置 CODEBUDDY_AUTH_TOKEN，将尝试 tokens.json 与本地 auth 文件", file=sys.stderr)
 
 if not API_KEY:
     print("[!] 未设置 API_KEY 环境变量，API 将无鉴权保护", file=sys.stderr)
@@ -81,9 +80,9 @@ if not API_KEY:
 
 
 def _get_client() -> ApiClient | None:
-    """延迟初始化 ApiClient（每次请求复用单例）。"""
-    if not CODEBUDDY_AUTH_TOKEN:
-        return None
+    """返回 ApiClient 单例；尚未初始化时尝试初始化（每次请求复用）。"""
+    if _client_singleton is None:
+        init_client()
     return _client_singleton
 
 
@@ -93,9 +92,6 @@ _client_singleton: ApiClient | None = None
 
 def init_client():
     global _client_singleton
-    if not CODEBUDDY_AUTH_TOKEN:
-        print("[!] CODEBUDDY_AUTH_TOKEN 未设置，跳过客户端初始化", file=sys.stderr)
-        return
     try:
         token_info = find_and_load_token()
         _client_singleton = ApiClient(
@@ -310,7 +306,7 @@ async def health():
     status = "ok" if client else "degraded"
     return {
         "status": status,
-        "codebuddy_configured": bool(CODEBUDDY_AUTH_TOKEN),
+        "codebuddy_configured": client is not None,
         "api_key_configured": bool(API_KEY),
     }
 

@@ -70,6 +70,29 @@ AUTH_FILE_PATHS = [
     os.path.expanduser("~/.config/workbuddy/auth/workbuddy-desktop.info"),
 ]
 
+
+def _windows_auth_paths() -> list[str]:
+    """Windows 桌面端的 auth 文件位置（%APPDATA% / %LOCALAPPDATA%）。"""
+    paths = []
+    for var in ("APPDATA", "LOCALAPPDATA"):
+        base = os.environ.get(var)
+        if base:
+            paths.append(os.path.join(
+                base, "CodeBuddyExtension", "Data", "Public", "auth",
+                "workbuddy-desktop.info",
+            ))
+    return paths
+
+
+if os.name == "nt":
+    AUTH_FILE_PATHS += _windows_auth_paths()
+
+# tokens.json（token-acquisition 产物 / 手工配置），默认取项目根目录
+TOKENS_FILE = os.environ.get(
+    "WORKBUDDY_TOKENS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json"),
+)
+
 # ── Thinking Level Model Map ───────────────────────────────────────────────
 # 哪些模型支持 reasoning_effort 参数（经 /v2/chat/completions 实测验证）
 THINKING_CAPABLE_MODELS = {
@@ -98,6 +121,20 @@ THINKING_LEVELS = {
     "max": "max",        # 最大思考深度（如 deepseek-r1）
 }
 DEFAULT_THINKING = "max"
+
+# ── Reasoning Replay ───────────────────────────────────────────────────────
+# 上游 /v2/chat/completions 反序列化 messages 时只读取 role / content / tool_calls
+# 等白名单字段，assistant 消息上的 reasoning_content 会被静默丢弃：实测在上一轮
+# assistant 消息中注入 500 字思考，下一轮 prompt_tokens 增量恒为 0，底座模型完全
+# 感知不到前序思考。因此在发送前把思考折叠进 content，使其随历史消息一起进入
+# Jinja / Chat Template 编码。
+REPLAY_REASONING = os.environ.get("REPLAY_REASONING", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+# 折叠思考时使用的包裹标签
+REASONING_TAG = "thinking"
+# 视为思考内容的扩展字段（兼容不同客户端的命名）
+REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
 
 # ── Safety / Anti-Ban Config ───────────────────────────────────────────────
 # 最小请求间隔（秒），模拟真实用户操作节奏
@@ -217,8 +254,59 @@ def extract_token_from_auth_file(filepath: str) -> dict | None:
     }
 
 
+def extract_token_from_tokens_file(filepath: str) -> dict | None:
+    """从 tokens.json 中提取 token 信息。
+
+    常见结构（token-acquisition 产物）::
+
+        {
+          "tokens": [{"name": "momo", "token_info": {"access_token": "..."}}],
+          "updated_at": "1970-01-01T00:00:00"
+        }
+
+    也兼容直接给出 token_info 对象、或只给 access_token 的简写形式；
+    缺失的 user_id / domain / 过期时间会从 JWT 中推导。
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+    raw = data
+    if isinstance(data, dict) and isinstance(data.get("tokens"), list):
+        raw = None
+        for entry in data["tokens"]:
+            if isinstance(entry, dict) and isinstance(entry.get("token_info"), dict):
+                raw = entry["token_info"]
+                break
+    if not isinstance(raw, dict):
+        return None
+
+    access_token = raw.get("access_token") or raw.get("accessToken")
+    if not access_token:
+        return None
+
+    refresh_token = raw.get("refresh_token") or raw.get("refreshToken") or ""
+    access_claims = decode_jwt_payload(access_token) or {}
+    refresh_claims = decode_jwt_payload(refresh_token) or {} if refresh_token else {}
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": raw.get("token_type") or raw.get("tokenType") or "Bearer",
+        "expires_at": raw.get("expires_at") or access_claims.get("exp", 0),
+        "refresh_expires_at": raw.get("refresh_expires_at") or refresh_claims.get("exp", 0),
+        "domain": raw.get("domain") or jwt_get_domain(access_token) or "www.codebuddy.cn",
+        "user_id": raw.get("user_id") or jwt_get_user_id(access_token) or "",
+        "nickname": raw.get("nickname", ""),
+        "enterprise_id": raw.get("enterprise_id", ""),
+        "account_type": raw.get("account_type", "personal"),
+    }
+
+
 def find_and_load_token(auth_file_override: str | None = None) -> dict:
-    """按优先级查找并加载 token：环境变量 > 指定文件 > 默认路径。"""
+    """按优先级查找并加载 token：环境变量 > 指定文件 > tokens.json > 默认路径。"""
     env_token = os.environ.get("CODEBUDDY_AUTH_TOKEN")
     if env_token:
         user_id = jwt_get_user_id(env_token) or ""
@@ -242,6 +330,10 @@ def find_and_load_token(auth_file_override: str | None = None) -> dict:
             return result
         print(f"[!] 指定的 auth 文件无效: {auth_file_override}", file=sys.stderr)
 
+    result = extract_token_from_tokens_file(TOKENS_FILE)
+    if result:
+        return result
+
     for path in AUTH_FILE_PATHS:
         result = extract_token_from_auth_file(path)
         if result:
@@ -254,6 +346,72 @@ def find_and_load_token(auth_file_override: str | None = None) -> dict:
             " | ".join(AUTH_FILE_PATHS)
         )
     )
+
+
+# ── Reasoning Replay ───────────────────────────────────────────────────────
+def extract_reasoning(message: dict) -> str:
+    """提取消息中的思考内容，兼容各客户端对思考字段的命名与结构。"""
+    for field in REASONING_FIELDS:
+        value = message.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, list):
+            # Anthropic 风格: [{"type": "thinking", "thinking": "..."}]
+            blocks = []
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    blocks.append(item.strip())
+                elif isinstance(item, dict):
+                    text = item.get("thinking") or item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        blocks.append(text.strip())
+            if blocks:
+                return "\n\n".join(blocks)
+    return ""
+
+
+def replay_reasoning(messages: list[dict]) -> list[dict]:
+    """把 assistant 历史消息中的思考折叠进 content，避免被上游静默丢弃。
+
+    上游 /v2/chat/completions 只读取 role / content / tool_calls 等白名单字段，
+    assistant 消息上的 reasoning_content 不会进入 Jinja / Chat Template。折叠进
+    content 后，前序思考才能随历史消息一起被底座模型编码，多轮对话不再丢失记忆。
+
+    - 仅处理 assistant 消息，user / system 消息原样透传
+    - content 已内联相同思考时不重复注入（幂等）
+    - 非字符串 content（多模态块等）保持原样
+    - 不修改入参，返回新的消息列表
+    """
+    if not REPLAY_REASONING or not messages:
+        return messages
+
+    replayed = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            replayed.append(message)
+            continue
+
+        reasoning = extract_reasoning(message)
+        if not reasoning:
+            replayed.append(message)
+            continue
+
+        content = message.get("content")
+        if content is None:
+            content = ""
+        if not isinstance(content, str) or reasoning in content:
+            replayed.append(message)
+            continue
+
+        block = f"<{REASONING_TAG}>\n{reasoning}\n</{REASONING_TAG}>"
+        merged = dict(message)
+        merged["content"] = f"{block}\n\n{content}" if content else block
+        # 这些扩展字段会被上游丢弃，去掉以免误判为已生效
+        for field in REASONING_FIELDS:
+            merged.pop(field, None)
+        replayed.append(merged)
+
+    return replayed
 
 
 # ── HTTP Client ────────────────────────────────────────────────────────────
@@ -415,7 +573,8 @@ class ApiClient:
         # 构建请求体（对齐真实客户端字段顺序）
         body: dict = {
             "model": model,
-            "messages": messages,
+            # 上游会丢弃 assistant 消息上的 reasoning_content，需先折叠进 content
+            "messages": replay_reasoning(messages),
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": stream,
@@ -930,7 +1089,11 @@ def interactive_chat(client: ApiClient, model: str, thinking_level: str | None):
 
         if result:
             content = result.get("content", "") if isinstance(result, dict) else result
-            conversation.append({"role": "assistant", "content": content})
+            assistant_message: dict = {"role": "assistant", "content": content}
+            if isinstance(result, dict) and result.get("reasoning_content"):
+                # 下一轮由 replay_reasoning 折叠进 content 回放给上游
+                assistant_message["reasoning_content"] = result["reasoning_content"]
+            conversation.append(assistant_message)
         else:
             print("\n[!] 未收到回复")
             conversation.pop()
