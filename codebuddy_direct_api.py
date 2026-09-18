@@ -97,11 +97,11 @@ TOKENS_FILE = os.environ.get(
 # 哪些模型支持 reasoning_effort 参数（经 /v2/chat/completions 实测验证）
 THINKING_CAPABLE_MODELS = {
     # DeepSeek 系列
-    "deepseek-v3", "deepseek-v3-0324", "deepseek-v3-1",
-    "deepseek-r1", "deepseek-r1-0528", "deepseek-v4-flash",
+    "deepseek-v3", "deepseek-v3-0324",
+    "deepseek-r1", "deepseek-v4-flash",
     "deepseek-v4-pro", "deepseek-v3-2-volc",
     # GLM 系列
-    "glm-5.1", "glm-5.0", "glm-5.2",
+    "glm-5.1", "glm-5.2",
     # Kimi 系列（实测支持 reasoning_effort，默认开启思考）
     "kimi-k2.5", "kimi-k2.6", "kimi-k2.7", "kimi-k3-1",
     # HY 系列
@@ -1104,11 +1104,13 @@ def interactive_chat(client: ApiClient, model: str, thinking_level: str | None):
 # ── Model Registry ─────────────────────────────────────────────────────────
 # 当前项目支持的所有模型（单一数据源，/v1/models 与 CLI 共用）
 # 已在 /v2/chat/completions 实测验证可用
+# 2026-09-18 移除上游已下架（返回 model service info not found）的 4 个模型：
+# deepseek-r1-0528 / deepseek-v3-1 / glm-4.7 / glm-5.0
 KNOWN_CHAT_MODELS = {
     # DeepSeek 系列
-    "deepseek-v3", "deepseek-v3-0324", "deepseek-v3-1",
+    "deepseek-v3", "deepseek-v3-0324",
     "deepseek-v3-0324-lkeap", "deepseek-v3-1-lkeap",
-    "deepseek-r1", "deepseek-r1-0528", "deepseek-r1-0528-lkeap",
+    "deepseek-r1", "deepseek-r1-0528-lkeap",
     "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v3-2-volc",
     # Kimi 系列
     "kimi-k2.5", "kimi-k2.6", "kimi-k2.7", "kimi-k3-1",
@@ -1117,7 +1119,7 @@ KNOWN_CHAT_MODELS = {
     # MiniMax 系列
     "minimax-m2.7",
     # GLM 系列
-    "glm-4.7", "glm-5.0", "glm-5.1", "glm-5.2", "glm-5.0-turbo", "glm-5v-turbo",
+    "glm-5.1", "glm-5.2", "glm-5.0-turbo", "glm-5v-turbo",
     # HY 系列
     # hy3-preview 免费版；hy3-preview-agent 收费版（x0.04 credits，功能相同）
     "hy3", "hy3-preview", "hy3-preview-agent",

@@ -1,7 +1,7 @@
 # 思考回放与 Codex 接入 · 交接文档
 
-> 最后更新：2026-09-18（第二轮会话）
-> 状态：思考回放修复已完成并通过真实上游验证；`tokens.json` 接入已补齐；Codex 接入**待实现**
+> 最后更新：2026-09-19（第三轮会话）
+> 状态：思考回放修复已完成并通过真实上游验证；`tokens.json` 接入已补齐；Codex / Claude Code 经 CC Switch 接入（本项目无需改代码）
 > 相关：[Codex 接入说明](codex-integration.md) ｜ [文档索引](README.md)
 
 ## 一句话结论
@@ -45,8 +45,8 @@ python docs/probe_reasoning_replay.py models    # 模型可用性扫描
 | Chat Completions `/v1/chat/completions`（SSE 流式 + `reasoning_content` 下行） | ✅ 可用 |
 | 图片生成 / 图片编辑 | ✅ 可用 |
 | `tokens.json` 配置 | ✅ 已接入 |
-| 模型清单 `/v1/models` | ⚠️ 可用，但其中 4 个模型上游已下架（见 F-004） |
-| Responses API `/v1/responses` | ❌ 未实现 → **Codex 无法直接接入**，见 F-005 与 Codex 接入说明 |
+| 模型清单 `/v1/models` | ✅ 可用；4 个上游已下架模型已移除（见 F-004） |
+| Responses API `/v1/responses` | ❌ 未实现，且**不需要**：协议转换由 CC Switch 承担，见 F-005 |
 | 上游 `usage` 透出 | ❌ 被丢弃，仓库内无法做 token 级断言 |
 
 ## 变更清单（两轮会话累计）
@@ -348,35 +348,39 @@ Cherry Studio 等）在多轮场景丢思考；单轮输出不受影响。
 
 ### F-004
 
-- title: `/v1/models` 与 README 中 4 个模型上游已下架
+- title: `/v1/models` 与 README 中 4 个模型上游已下架（已移除）
 - severity: low
 - category: misconfig
-- status: validated
+- status: fixed
 - evidence_ids: [E-008]
-- location: `codebuddy_direct_api.py:1107` `KNOWN_CHAT_MODELS`、`README.md` 模型清单
+- location: `codebuddy_direct_api.py` `KNOWN_CHAT_MODELS` / `THINKING_CAPABLE_MODELS`、`README.md` 模型清单
 - impact: 客户端选中这些模型会直接收到上游 400；`/v1/models` 的清单不完全可信
 - confidence: high
 - repro_steps:
   1. `python docs/probe_reasoning_replay.py models`
   2. 观察 4 条 `service info not found`
-- remediation: 待定 —— 从 `KNOWN_CHAT_MODELS` 移除，或标注为「上游不可用」保留
+- remediation: 已修复（2026-09-19）—— 从 `KNOWN_CHAT_MODELS` 与 `THINKING_CAPABLE_MODELS`
+  移除这 4 个模型；保留名称相近但实测可用的 `deepseek-r1-0528-lkeap` /
+  `deepseek-v3-1-lkeap` / `glm-5.0-turbo`。`/v1/models` 现返回 28 个模型
 - optional_attack:
 
 ### F-005
 
-- title: Codex 无法直接接入本项目（缺少 Responses API）
+- title: Codex 不能以 Responses API 直连本项目（需经 CC Switch 协议转换）
 - severity: medium
 - category: design
-- status: validated
+- status: resolved
 - evidence_ids: [E-009]
 - location: `server.py`（现有路由）
 - impact: Codex 0.155.0 的 `wire_api` 只接受 `responses`，本项目只提供
-  `/v1/chat/completions`，因此 Codex 不能直接把本服务当模型源
+  `/v1/chat/completions`，因此 Codex 不能**直连**本服务（可用 CC Switch 中转，见 remediation）
 - confidence: high
 - repro_steps:
   1. 临时 `CODEX_HOME` 下把 `model_providers.custom.wire_api` 写成非法值并 `codex exec`
   2. 观察报错只列出 `responses`
-- remediation: 在 `server.py` 增加 `/v1/responses` 适配层，见 `docs/codex-integration.md`
+- remediation: 已解决，且**不需要改代码** —— 由 CC Switch 本地代理承担协议转换：
+  把本项目作为 `apiFormat = openai_chat` 的 provider 加进 CC Switch，Codex 与 Claude Code
+  均走该路线。字段填法与排错见 `docs/codex-integration.md`
 - optional_attack:
 
 ### P-001
@@ -394,20 +398,23 @@ Cherry Studio 等）在多轮场景丢思考；单轮输出不受影响。
 
 ## 已知边界与风险
 
-- **Codex 不能直接接入**：需要 Responses API（F-005）。要在 Codex 里用这些模型，得先实现适配层。
+- **Codex 需经 CC Switch 接入**：Codex 只支持 Responses API（F-005），但**不需要改本项目代码** ——
+  由 CC Switch 本地代理做协议转换，见 [codex-integration.md](codex-integration.md)。
 - **token 成本上升**：历史思考现在会被真正编码，长会话 `prompt_tokens` 高于修复前，属预期代价。
 - **不影响下行展示**：折叠只发生在上行请求体，客户端收到的 `content` 仍是模型原始回答。
 - **多模态轮次不回放**：`content` 为块数组时跳过折叠（有意为之）。
-- **4 个模型上游不可用**（F-004），`hy3-preview-agent` 为收费模型未测。
+- **4 个模型上游已下架且已移除**（F-004），`hy3-preview-agent` 为收费模型未测。
 - **`_conversation_id` 仍在回传**：上游可能同时维护服务端会话状态，与折叠叠加时的行为未单独验证。
 - **既有问题（未修）**：`server.py:70` 读取了 `DEFAULT_THINKING`，但流式路径默认值写死为 `"max"`，该环境变量实际不生效。
 
 ## 下一步待办
 
-**P0 — 在 Codex 中使用这些模型**
+**P0 — 在 Codex / Claude Code 中使用这些模型**
 
-- 在 `server.py` 实现 `POST /v1/responses`（Responses API → Chat Completions 适配，含 SSE 事件映射），
-  然后按 `docs/codex-integration.md` 配置 `~/.codex/config.toml`。
+- 路线已确定（2026-09-19）：**不改本项目代码**，由 CC Switch 本地代理承担协议转换。
+  启动本项目（`.\start.ps1`）→ 在 CC Switch 新增 `apiFormat = openai_chat` 的 provider
+  （base_url = `http://127.0.0.1:8000/v1`）→ 切换供应商 → Codex / Claude Code 即可使用。
+  字段填法与排错见 `docs/codex-integration.md`。
 
 **P1 — 可观测性**
 

@@ -3,6 +3,9 @@
 Wrap WorkBuddy's internal API into an **OpenAI-compatible REST API** — deploy in one line, call from anywhere.
 
 > 中文版: [README.md](README.md)
+>
+> This is a fork of [Tom6814/WorkBuddy2API](https://github.com/Tom6814/WorkBuddy2API).
+> See [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md) for what this fork changes.
 
 ---
 
@@ -33,6 +36,22 @@ cat ~/Library/Application\ Support/CodeBuddyExtension/Data/Public/auth/workbuddy
 ```
 
 ### 2. Run locally
+
+One-command start (installs deps if needed, pre-checks the token):
+
+```powershell
+# Windows
+.\start.ps1                     # defaults to port 8000
+.\start.ps1 -Port 9000          # custom port
+```
+
+```bash
+# Linux / macOS
+./start.sh                      # defaults to port 8000
+PORT=9000 ./start.sh
+```
+
+Or start it manually:
 
 ```bash
 pip install fastapi uvicorn
@@ -143,10 +162,9 @@ curl https://your-domain/v1/images/edits \
 
 ```
 # DeepSeek
-deepseek-v3        deepseek-v3-0324        deepseek-v3-1
-deepseek-v3-0324-lkeap  deepseek-v3-1-lkeap
-deepseek-r1        deepseek-r1-0528        deepseek-r1-0528-lkeap
-deepseek-v4-flash  deepseek-v4-pro         deepseek-v3-2-volc
+deepseek-v3  deepseek-v3-0324  deepseek-v3-0324-lkeap
+deepseek-v3-1-lkeap  deepseek-r1  deepseek-r1-0528-lkeap
+deepseek-v4-flash  deepseek-v4-pro  deepseek-v3-2-volc
 
 # Kimi
 kimi-k2.5          kimi-k2.6               kimi-k2.7
@@ -159,8 +177,7 @@ hunyuan-chat       hunyuan-2.0-instruct    hunyuan-2.0-thinking
 minimax-m2.7
 
 # GLM
-glm-4.7            glm-5.0                 glm-5.1
-glm-5.2            glm-5.0-turbo           glm-5v-turbo
+glm-5.1  glm-5.2  glm-5.0-turbo  glm-5v-turbo
 
 # HY
 hy3                hy3-preview (free)      hy3-preview-agent (paid)
@@ -174,8 +191,9 @@ hunyuan-image-v2.0-general-edit           (image-to-image)
 
 > You can also get the full model list anytime via `GET /v1/models`.
 
-> ⚠️ Verified on 2026-09-18: `deepseek-r1-0528`, `deepseek-v3-1`, `glm-4.7` and `glm-5.0` are no longer
-> served upstream (they return `model [...] service info not found`). Use another model instead.
+> The list was corrected against a live upstream check on 2026-09-18: four models no longer served
+> upstream were removed (`deepseek-r1-0528`, `deepseek-v3-1`, `glm-4.7`, `glm-5.0`). See
+> [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md).
 
 ## API Endpoints
 
@@ -193,16 +211,34 @@ hunyuan-image-v2.0-general-edit           (image-to-image)
 codebuddy-api-server/
 ├── server.py                 # OpenAI-compatible REST API server
 ├── codebuddy_direct_api.py   # Direct CodeBuddy client (token/SSE/image)
+├── start.ps1 / start.bat     # one-command start (Windows)
+├── start.sh                  # one-command start (Linux / macOS)
 ├── Dockerfile                # Python 3.11 container
 ├── docs/                     # Handoff docs and self-check scripts
 └── README.md
 ```
 
-## Using with Codex
+## Using with Codex / Claude Code
 
-**Codex 0.155.0 only supports the Responses API (`wire_api = "responses"`), while this project only
-exposes `/v1/chat/completions`, so Codex cannot use it directly yet.** See
-[docs/codex-integration.md](docs/codex-integration.md) for the adapter plan and config example.
+**It works, and this project needs no code changes.**
+
+Codex 0.155.0 only speaks the Responses API (`wire_api = "responses"`), while this project only
+exposes `/v1/chat/completions`. The gap is bridged by **CC Switch's local proxy**: add this server
+as a provider with `apiFormat = openai_chat`, and CC Switch converts Codex's Responses requests /
+Claude Code's Anthropic requests into Chat Completions before forwarding them here.
+
+```text
+Start this server ( .\start.ps1 )
+        |
+        v
+CC Switch: add provider  apiFormat = openai_chat
+                         base_url = http://127.0.0.1:8000/v1
+        |
+        v
+Switch provider  ->  Codex (via 127.0.0.1:10001) / Claude Code are ready to use
+```
+
+Field-by-field setup, verification and troubleshooting: [docs/codex-integration.md](docs/codex-integration.md).
 
 Any other OpenAI-compatible client (Cherry Studio, Open WebUI, SDKs, scripts) can point its
 `base_url` at this server's `/v1` and work right away.
@@ -210,8 +246,9 @@ Any other OpenAI-compatible client (Cherry Studio, Open WebUI, SDKs, scripts) ca
 ## Documentation
 
 - [docs/README.md](docs/README.md) — documentation index
+- [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md) — what this fork changes vs. upstream
 - [Reasoning replay handoff](docs/2026-09-18_reasoning-replay-handoff.md) — root cause, fix, real-upstream verification, todos
-- [Codex integration](docs/codex-integration.md) — limitation, configuration, adapter checklist
+- [Codex / Claude Code integration](docs/codex-integration.md) — via CC Switch protocol translation
 - Self-checks: `python docs/verify_reasoning_replay.py` (offline), `python docs/probe_reasoning_replay.py replay|models` (live)
 
 ---

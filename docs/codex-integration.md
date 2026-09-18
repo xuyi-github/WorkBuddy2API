@@ -1,92 +1,152 @@
-# 在 Codex 中使用这些模型
+# 在 Codex / Claude Code 中使用（经 CC Switch 协议转换）
 
-## 结论（先看这里）
+> 最后更新：2026-09-19
+> 相关：[文档索引](README.md) ｜ [Fork 变更记录](FORK-CHANGES.md) ｜ [思考回放交接文档](2026-09-18_reasoning-replay-handoff.md)
 
-**目前不能直接接入。** Codex 0.155.0 只支持 Responses API（`wire_api` 的合法取值只有
-`responses`），而本项目只提供 Chat Completions（`/v1/chat/completions`）。要接入需要先给
-`server.py` 增加 `POST /v1/responses` 适配层，实现清单见下文。
+## 一句话结论
 
-其他 OpenAI 兼容客户端（Cherry Studio、Open WebUI、各类 SDK、脚本）不受此限制，把
-`base_url` 指到本服务的 `/v1` 即可直接用。
+可以接入，**本项目不需要改代码**。
 
-## 实测证据（2026-09-18）
+Codex 0.155.0 只会说 Responses API（`wire_api` 的合法取值只有 `responses`），而本项目只提供
+OpenAI Chat Completions（`/v1/chat/completions`）。这段协议差异交给 **CC Switch 的本地代理**：
 
-`wire_api` 的合法取值（用一个临时 `CODEX_HOME` 把值写成非法即可看到枚举）：
+CC Switch 支持把 `apiFormat` 为 `openai_chat` 的服务当作上游，会自动把客户端发来的
+Responses / Anthropic 请求转换后再转发。所以只要把本项目作为一个 `openai_chat` provider
+加进 CC Switch 就行。
 
-```text
-$ codex exec --skip-git-repo-check "hi"
-Error loading config.toml: unknown variant `bogus`, expected `responses`
-in `model_providers.custom.wire_api`
+```mermaid
+flowchart LR
+    A["Codex /wire_api=responses"] -->|POST /v1/responses| P["CC Switch 本地代理<br/>127.0.0.1:10001"]
+    B["Claude Code / Anthropic Messages"] -->|POST /v1/messages| P
+    P -->|协议转换 转成 /v1/chat/completions| W["本项目 server.py<br/>127.0.0.1:8000"]
+    W -->|POST /v2/chat/completions| U["copilot.tencent.com"]
 ```
 
-本机 `127.0.0.1:10001` 上跑的是 **CC Switch** 的本地代理（不是本项目），它转发到的上游
-provider 目前返回 401，所以 Codex 现在这条链路是断的：
+## 一、先启动本项目
 
-```text
-GET  http://127.0.0.1:10001/v1/models      -> {"models":[]}
-GET  http://127.0.0.1:10001/health         -> {"status":"healthy",...}
-POST http://127.0.0.1:10001/v1/responses   -> HTTP 401
-     "CC Switch local proxy failed while handling Codex endpoint /responses.
-      Provider: agent-hx-ds-v4 copy; model: deepseek-v4-flash;
-      upstream_status: HTTP 401; cause: unauthorized client detected, ..."
+Windows（PowerShell）：
+
+```powershell
+.\start.ps1                    # 默认 8000 端口
+.\start.ps1 -Port 9000         # 换端口
 ```
 
-## 适配完成后的 Codex 配置
-
-1. 启动本服务：
+Linux / macOS：
 
 ```bash
-export CODEBUDDY_AUTH_TOKEN="<your token>"   # 或把 token 放进 tokens.json
-export API_KEY="<your own key>"
-python server.py                             # 默认 8000 端口
+./start.sh                     # 默认 8000 端口
+PORT=9000 ./start.sh
 ```
 
-2. 在 `~/.codex/config.toml` 里**新增**一个 provider 和 profile（不要覆盖你已有的 CC Switch 配置，
-   两者可以并存），把 `wire_api` 设成 `responses`：
+启动前建议设一个 API Key（不设也能跑，但等于没有鉴权保护）：
+
+```powershell
+$env:API_KEY = "你自定的 key"
+.\start.ps1
+```
+
+确认服务活着：
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status":"ok","codebuddy_configured":true,"api_key_configured":true}
+```
+
+| 字段 | 期望 | 含义 |
+|---|---|---|
+| `codebuddy_configured` | `true` | token 加载成功（来自 `tokens.json` 或 `CODEBUDDY_AUTH_TOKEN`） |
+| `api_key_configured` | `true` | 已设置 `API_KEY`，调用需带 `Authorization: Bearer <key>` |
+
+## 二、在 CC Switch 里新增 provider
+
+CC Switch → 新增供应商。**唯一要点：接口格式必须选 `openai_chat`。**
+
+| CC Switch 字段 | 填什么 | 说明 |
+|---|---|---|
+| 应用 / App | `Codex` 或 `Claude` | 想在 Codex 用就选 Codex，想在 Claude Code 用就选 Claude |
+| 名称 / Name | `WorkBuddy2API` | 随便起，只是个标签 |
+| 接口格式 / API Format | **`openai_chat`** | 关键项。本项目是 OpenAI Chat Completions 兼容 |
+| 基础地址 / Base URL | `http://127.0.0.1:8000/v1` | 端口要和 `start.ps1 -Port` 一致，**结尾必须带 `/v1`** |
+| API Key | 启动本项目时设的 `API_KEY` | 若没设 `API_KEY`，这里填任意非空字符串即可 |
+| 模型 / Model | `deepseek-v4-pro` 等 | 见第三节 |
+
+界面上中英文叫法可能不同，认准底层字段名：`apiFormat` / `base_url` / `apiKey` / `model`。
+
+> 若界面提供「拉取模型列表」，先启动本项目再点，会直接读到 `/v1/models` 的 28 个模型。
+
+然后：
+
+1. 确认 CC Switch 的 **本地代理（Local Proxy）** 已开启，监听 `127.0.0.1:10001`。
+2. 把 Codex（或 Claude）的当前供应商切换成刚新增的 `WorkBuddy2API`。
+
+切换后 CC Switch 会自动改写 `~/.codex/config.toml`（**不需要手动改**），形如：
 
 ```toml
-[model_providers.workbuddy]
-name = "WorkBuddy"
-base_url = "http://127.0.0.1:8000/v1"
-wire_api = "responses"
-env_key = "WORKBUDDY_API_KEY"
+model_provider = "custom"
+model = "deepseek-v4-pro"
 
-[profiles.workbuddy]
-model = "deepseek-v4-pro"          # 实测有 reasoning_content 下行
-model_provider = "workbuddy"
-model_reasoning_effort = "high"
+[model_providers.custom]
+wire_api = "responses"
+base_url = "http://127.0.0.1:10001/v1"
+experimental_bearer_token = "PROXY_MANAGED"
 ```
 
-3. 设置密钥并启动：
+注意 `wire_api` 仍是 `responses`、`base_url` 指向 10001：Codex 说的依然是 Responses API，
+转换发生在 CC Switch 本地代理那一侧。**本项目收到的是已经转换好的 `/v1/chat/completions`。**
+
+## 三、选哪个模型
+
+模型名直接用 `/v1/models` 返回的名字。按 2026-09-18 实测：
+
+| 类别 | 模型 |
+|---|---|
+| 有 `reasoning_content` 下行（推荐） | `deepseek-v4-pro`、`deepseek-v4-flash`、`deepseek-v3-2-volc`、`deepseek-r1`、`glm-5.1`、`kimi-k2.5`、`hunyuan-2.0-thinking`、`minimax-m2.7` |
+| 无独立思考通道（不会输出思考） | `deepseek-v3`、`hy3-preview` |
+| 上游已下架（已从清单移除） | `deepseek-r1-0528`、`deepseek-v3-1`、`glm-4.7`、`glm-5.0` |
+
+想看到折叠的思考块，优先选第一类。
+
+## 四、验证
 
 ```bash
-export WORKBUDDY_API_KEY="<your API_KEY>"
-codex --profile workbuddy
-# 或临时覆盖：codex -c model_provider=workbuddy -m deepseek-v4-pro
+# 1. 本项目直连（绕过 CC Switch）
+curl http://127.0.0.1:8000/v1/models
+
+# 2. CC Switch 本地代理是否活着
+curl http://127.0.0.1:10001/health
+
+# 3. Codex 走通最小闭环
+codex exec --skip-git-repo-check "say hi"
 ```
 
-模型名直接用 `/v1/models` 返回的名字（如 `deepseek-v4-pro`、`glm-5.1`、`kimi-k2.7`）。
-想看到思考过程，优先选实测有 `reasoning_content` 下行的模型；`deepseek-v3` 与 `hy3-preview`
-本身没有独立思考通道。另有 4 个模型上游已下架，见交接文档 F-004。
+多轮思考回放是否生效（需要 token，会真实调用上游）：
 
-## `server.py` 需要新增什么
+```bash
+python docs/probe_reasoning_replay.py replay   # 期望 PASS
+```
 
-Responses API 与 Chat Completions 的差异需要翻译，建议复用现有
-`ApiClient.chat_completion()`（已包含 token 管理与思考折叠），只在 `server.py` 做协议层。
+## 五、排错
 
-| 方向 | 处理要点 |
-|------|----------|
-| 请求 | `input`（字符串或 item 数组）→ `messages`；`instructions` → `system`；`max_output_tokens` → `max_tokens`；`reasoning.effort` → `reasoning_effort` |
-| 请求（工具） | Responses 的扁平 `tools[]` → Chat Completions 的 `{type, function: {...}}` |
-| 请求（有状态） | 关注 `store` / `previous_response_id`；本项目无服务端状态，需忽略或按无状态回退 |
-| 响应（流式） | 至少实现 `response.created`、`response.output_item.added`、`response.content_part.added`、`response.output_text.delta`、`response.completed`；思考内容走 reasoning 相关 item 事件（以 `codex` 实际请求为准） |
-| 响应（非流式） | 组装 `{id, object: "response", status: "completed", output: [{type: "message", content: [{type: "output_text", text}]}], usage}` |
-| 错误 | 用 Responses 的错误结构返回，HTTP 状态码保持一致 |
-| usage | 上游每个 SSE chunk 都带 `usage`，适配层可顺带把它透出 |
+| 现象 | 原因 / 处理 |
+|---|---|
+| `codebuddy_configured: false`，请求返回 503 | token 没加载到。确认 `tokens.json` 在项目根目录，或设置 `CODEBUDDY_AUTH_TOKEN` |
+| 401 / `unauthorized client detected` | 这是 CC Switch 里**其他** provider 的上游报的错，不是本项目。确认当前选中的是新增的 `WorkBuddy2API` |
+| 能连通但返回 404 | Base URL 少了 `/v1` |
+| 首字很慢、然后整段一次性刷出来 | 已知限制：本项目内部先收完上游完整响应，再切成 SSE 分块下发，不是端到端真流式 |
+| CC Switch 用量统计里 token 恒为 0 | 已知限制：本项目暂不透出上游 `usage`（见交接文档 P1 待办） |
 
-## 回归验证步骤
+## 依据：为什么 CC Switch 能做这个转换
 
-1. `python docs/verify_reasoning_replay.py` —— 确认适配没有破坏思考折叠逻辑。
-2. 先测非流式 `POST /v1/responses` 的返回结构，再测流式事件序列。
-3. `codex exec --skip-git-repo-check "say hi"` 走通最小闭环。
-4. `python docs/probe_reasoning_replay.py replay` —— 多轮思考仍然生效。
+- CC Switch 的 provider 记录带 `meta.apiFormat` 字段，实测取值含 `openai_chat` /
+  `openai_responses` / `anthropic`（本机 `cc-switch.db` 的 `providers` 表）。
+- 本机已存在一个 `apiFormat = openai_chat` 的 Codex provider，说明「Codex（Responses 客户端）→
+  openai_chat 上游」这条转换路径是 CC Switch 已有的用法。
+- 开启本地代理后，CC Switch 会把 `~/.codex/config.toml` 的 `base_url` 指向
+  `http://127.0.0.1:10001/v1` 并写入 `experimental_bearer_token = "PROXY_MANAGED"`，
+  由代理注入真实上游密钥，说明请求确实经代理中转。
+
+## 附：早期结论已作废
+
+本文件 2026-09-18 版本曾写「Codex 无法接入，需要先给 `server.py` 实现 `/v1/responses`」。
+那个结论只考虑了直连场景，**没有考虑 CC Switch 的协议转换能力**，现已更正：
+本项目保持只提供 Chat Completions，Responses 转换由 CC Switch 承担。
