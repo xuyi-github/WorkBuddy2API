@@ -132,8 +132,8 @@ python docs/probe_reasoning_replay.py replay   # 期望 PASS
 | `codebuddy_configured: false`，请求返回 503 | token 没加载到。确认 `tokens.json` 在项目根目录，或设置 `CODEBUDDY_AUTH_TOKEN` |
 | 401 / `unauthorized client detected` | 这是 CC Switch 里**其他** provider 的上游报的错，不是本项目。确认当前选中的是新增的 `WorkBuddy2API` |
 | 能连通但返回 404 | Base URL 少了 `/v1` |
-| 首字很慢、然后整段一次性刷出来 | 已知限制：本项目内部先收完上游完整响应，再切成 SSE 分块下发，不是端到端真流式 |
-| CC Switch 用量统计里 token 恒为 0 | 已知限制：本项目暂不透出上游 `usage`（见交接文档 P1 待办） |
+| 首字很慢 | 首字延迟 = 上游首字延迟。推理模型要先思考，通常 1–3s。本项目已不做整体缓冲 |
+| CC Switch 用量统计拿不到 token | 本项目已在流式收尾块透出 `usage`；想让上游统计更准，客户端可带 `stream_options: {"include_usage": true}` |
 
 ## 依据：为什么 CC Switch 能做这个转换
 

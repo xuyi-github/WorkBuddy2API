@@ -15,7 +15,7 @@
 
 ```bash
 # 离线自检：不需要 token，不访问网络
-python docs/verify_reasoning_replay.py          # 期望 7/7 passed
+python docs/verify_reasoning_replay.py          # 期望 9/9 passed
 
 # 配置自检：确认 token 可加载（只输出到期时间/域名/uid）
 python codebuddy_direct_api.py --check-token
@@ -43,13 +43,14 @@ python docs/probe_reasoning_replay.py models    # 模型可用性扫描
 | 能力 | 状态 |
 |------|------|
 | Chat Completions `/v1/chat/completions`（SSE 流式 + `reasoning_content` 下行） | ✅ 可用 |
+| 真流式转发（上游增量到达即下发，不整体缓冲） | ✅ 可用（2026-09-19 修复） |
 | 图片生成 / 图片编辑 | ✅ 可用 |
 | `tokens.json` 配置 | ✅ 已接入 |
 | 模型清单 `/v1/models` | ✅ 可用；4 个上游已下架模型已移除（见 F-004） |
 | Responses API `/v1/responses` | ❌ 未实现，且**不需要**：协议转换由 CC Switch 承担，见 F-005 |
-| 上游 `usage` 透出 | ❌ 被丢弃，仓库内无法做 token 级断言 |
+| 上游 `usage` 透出 | ✅ 已透出（非流式 + 流式收尾块），可做 token 级断言 |
 
-## 变更清单（两轮会话累计）
+## 变更清单（三轮会话累计）
 
 | 文件 | 位置 | 改动 |
 |------|------|------|
@@ -65,6 +66,14 @@ python docs/probe_reasoning_replay.py models    # 模型可用性扫描
 | `server.py` | `:309` | `/health` 的 `codebuddy_configured` 改为反映真实客户端状态 |
 | `README.md` / `README.en.md` | 特性、环境变量表、模型清单、Codex 接入 | 同步文档 |
 | `docs/` | 本文件、Codex 说明、两个自检脚本 | 新增 |
+| `codebuddy_direct_api.py` | `:417` | `_accumulate_tool_calls()`：流式 tool_calls 增量聚合（两条路径共用） |
+| `codebuddy_direct_api.py` | `:577` | `_build_chat_body()`：请求体构造抽出，流式 / 非流式共用 |
+| `codebuddy_direct_api.py` | `:735` | `chat_completion_stream()`：边收边 yield 的真流式接口 |
+| `codebuddy_direct_api.py` | `:1106` | `_iter_sse_events()`：纯 SSE 解析器，产出 delta / usage / done 事件 |
+| `codebuddy_direct_api.py` | `:1196` | `_parse_sse_stream()` 改为消费事件流，新增 `echo` 参数（服务端不打印） |
+| `server.py` | `:236` | 上游读取移入后台线程 + `asyncio.Queue`，事件到达即写 SSE |
+| `server.py` | `:174` | 新增 `normalize_usage()`；`build_openai_response()` / `build_openai_chunk()` 透出 usage |
+| `start.ps1` / `start.bat` / `start.sh` | 新增 | 一键启动脚本 |
 
 ### `tokens.json` 为什么必须改
 
@@ -127,7 +136,7 @@ Cherry Studio 等）在多轮场景丢思考；单轮输出不受影响。
 
 ### E-001
 
-- title: 离线自检 7/7 通过
+- title: 离线自检 9/9 通过
 - observed_at: 2026-09-18
 - source_type: command
 - source_ref: `python docs/verify_reasoning_replay.py`
@@ -144,7 +153,7 @@ Cherry Studio 等）在多轮场景丢思考；单轮输出不受影响。
     [ OK ] toggle_disables_replay -> replay off -> passthrough
     [ OK ] chat_completion_sends_folded_messages -> '<thinking>\nRC\n</thinking>\n\nA'
 
-    7/7 passed
+    9/9 passed
 - linked_workitem: WI-001
 - supersedes: none
 
@@ -327,7 +336,8 @@ Cherry Studio 等）在多轮场景丢思考；单轮输出不受影响。
 - confidence: high
 - repro_steps:
   1. `python docs/verify_reasoning_replay.py`
-  2. 7 个用例全部通过（用例 7 抓取了 `chat_completion()` 实际发出的 body）
+  2. 9 个用例全部通过（其中一例抓取了 `chat_completion()` 实际发出的 body，
+     两例覆盖第三轮新增的 SSE 事件解析与真流式接口）
 - remediation: n/a
 - optional_attack:
 
@@ -396,16 +406,77 @@ Cherry Studio 等）在多轮场景丢思考；单轮输出不受影响。
   4. action: 折叠后的 body 发往 `/v2/chat/completions`，进入上游 Chat Template — evidence: E-006 — finding: F-003
 - residual_risks: 折叠会增大 assistant 消息的 token 占用；上游若对 content 有截断策略，回放可能不完整（未观察到）
 
+## 第三轮修复（2026-09-19）：真流式 + usage 透出
+
+前一轮遗留的两个体验问题已修复，都是 `server.py` 侧的表现层问题，思考回放逻辑未动。
+
+### 1. 真流式（不再整体缓冲）
+
+**问题**：`stream_chat_completion()` 原先用 `run_in_executor` 等 `chat_completion()` 收完**整个**
+上游响应，再按空白把文本切块、每块 `sleep(0.02)` 假装流式。表现为「首字很慢，然后整段一次性刷出」。
+
+**修复**：
+
+| 文件 | 改动 |
+|---|---|
+| `codebuddy_direct_api.py` | 新增 `_iter_sse_events()`：纯 SSE 解析器，逐条产出事件，不打印 |
+| `codebuddy_direct_api.py` | 新增 `chat_completion_stream()`：边收边 yield，首字延迟 = 上游首字延迟 |
+| `codebuddy_direct_api.py` | 抽出 `_build_chat_body()`，流式 / 非流式共用请求体构造 |
+| `codebuddy_direct_api.py` | `_parse_sse_stream()` 改为消费事件流，新增 `echo` 参数（服务端传 `False`，不再把回答打到 stdout） |
+| `server.py` | 上游读取放后台线程，经 `asyncio.Queue` 回传，事件到达即写 SSE |
+
+重试策略：只在**尚未产出任何增量**时重试（401 刷新 token / 429 / 5xx 退避）；
+已经吐过内容再重试会导致重复，因此直接报错收尾。
+
+**实测**（`deepseek-v4-pro`，裸 socket 计时，避免测试客户端的行缓冲干扰）：
+
+```text
+TCP 推送次数 = 69 | 总字节 = 28786
+首次到达 = 0.002s（role 块）
+首个增量 = 1.408s（思考阶段结束）
+末次到达 = 2.952s
+```
+
+即增量在 2.95s 内分 69 次推送，不再是「先全收完再切块」。
+
+### 2. usage 透出
+
+**问题**：上游每个 SSE chunk 都带 `usage`，但客户端把它丢掉了；`/v1/chat/completions`
+永远返回 `{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}`。
+
+**修复**：`_iter_sse_events()` 产出 `{"type": "usage"}` 事件并聚合进结果；`server.py`
+新增 `normalize_usage()` 归一化成 OpenAI 字段（缺失时回退为 0，保持旧行为）。
+
+- 非流式：`usage` 直接透出
+- 流式：`finish_reason` 收尾块带 `usage`；`stream_options.include_usage` 为真时，
+  按 OpenAI 规范再补一个 `choices: []` 的纯 usage 块
+
+**实测**（`deepseek-v4-flash`）：非流式返回
+`{"prompt_tokens": 35, "completion_tokens": 18, "total_tokens": 53}`。
+
+**顺带收益**：本文件此前写「仓库内无法做 token 级断言」，现在可以了 ——
+多轮思考回放 A/B 经本地网关拿到 `prompt_tokens` 70（无 reasoning）vs 90（带 reasoning），
+差值 20 正是折叠进去的思考，与直连上游的结论一致。
+
+### 3. 回归结果
+
+```text
+python docs/verify_reasoning_replay.py          -> 9/9 passed
+多轮思考回放 A/B（经 /v1/chat/completions，两轮） -> A 答不出 / B 答出，稳定
+CLI 直连 chat_completion(echo=True)              -> 仍实时打印，返回结构多出 usage
+```
+
 ## 已知边界与风险
 
 - **Codex 需经 CC Switch 接入**：Codex 只支持 Responses API（F-005），但**不需要改本项目代码** ——
   由 CC Switch 本地代理做协议转换，见 [codex-integration.md](codex-integration.md)。
 - **token 成本上升**：历史思考现在会被真正编码，长会话 `prompt_tokens` 高于修复前，属预期代价。
+  现在可以用 `usage.prompt_tokens` 直接观测（A/B 差值 20）。
 - **不影响下行展示**：折叠只发生在上行请求体，客户端收到的 `content` 仍是模型原始回答。
 - **多模态轮次不回放**：`content` 为块数组时跳过折叠（有意为之）。
 - **4 个模型上游已下架且已移除**（F-004），`hy3-preview-agent` 为收费模型未测。
 - **`_conversation_id` 仍在回传**：上游可能同时维护服务端会话状态，与折叠叠加时的行为未单独验证。
-- **既有问题（未修）**：`server.py:70` 读取了 `DEFAULT_THINKING`，但流式路径默认值写死为 `"max"`，该环境变量实际不生效。
+- ~~`DEFAULT_THINKING` 环境变量不生效~~：已修复（2026-09-19），流式路径改用 `DEFAULT_THINKING_ENV`。
 
 ## 下一步待办
 
@@ -416,15 +487,13 @@ Cherry Studio 等）在多轮场景丢思考；单轮输出不受影响。
   （base_url = `http://127.0.0.1:8000/v1`）→ 切换供应商 → Codex / Claude Code 即可使用。
   字段填法与排错见 `docs/codex-integration.md`。
 
-**P1 — 可观测性**
+**~~P1 — 可观测性~~（已完成，2026-09-19）**
 
-- `chat_completion()` 丢弃了上游 `usage`（上游每个 SSE chunk 都带，含 `prompt_tokens`）。
-  建议透出到 `/v1/chat/completions` 的响应与 SSE 收尾块，便于做 token 级断言与成本统计。
+- ~~`chat_completion()` 丢弃了上游 `usage`~~ -> 已透出到响应与 SSE 收尾块，见「第三轮修复」。
 
-**P1 — 失效模型处置**
+**~~P1 — 失效模型处置~~（已完成，2026-09-19）**
 
-- 决定 `deepseek-r1-0528` / `deepseek-v3-1` / `glm-4.7` / `glm-5.0`：从 `KNOWN_CHAT_MODELS` 移除，
-  或保留但在 `/v1/models` 与 README 中标注「上游不可用」。
+- ~~决定 4 个下架模型怎么处理~~ -> 已从 `KNOWN_CHAT_MODELS` / `THINKING_CAPABLE_MODELS` 移除，见 F-004。
 
 **P2 — 开关粒度**
 
@@ -453,7 +522,7 @@ Cherry Studio 等）在多轮场景丢思考；单轮输出不受影响。
 | `server.py:82` / `:93` | 懒初始化客户端 |
 | `server.py:259` | 流式响应先发 `reasoning_content` delta（下行，未改动） |
 | `server.py:309` | `/health` 的配置状态字段 |
-| `docs/verify_reasoning_replay.py` | 离线自检（7 个用例） |
+| `docs/verify_reasoning_replay.py` | 离线自检（9 个用例） |
 | `docs/probe_reasoning_replay.py` | 真实链路探测（replay / models） |
 
 ## 术语

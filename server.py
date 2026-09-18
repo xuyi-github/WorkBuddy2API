@@ -35,6 +35,7 @@ import json
 import time
 import uuid
 import asyncio
+import threading
 import traceback
 from typing import Optional
 
@@ -155,6 +156,7 @@ def build_openai_chunk(
     role: str | None = None,
     finish_reason: str | None = None,
     created: int | None = None,
+    usage: dict | None = None,
 ) -> dict:
     """构建 OpenAI 兼容的 SSE chunk。"""
     delta = {}
@@ -166,7 +168,7 @@ def build_openai_chunk(
         delta["reasoning_content"] = reasoning_content
     if tool_calls:
         delta["tool_calls"] = tool_calls
-    return {
+    chunk = {
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "created": created or int(time.time()),
@@ -177,6 +179,21 @@ def build_openai_chunk(
             "finish_reason": finish_reason,
         }],
     }
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
+
+
+def normalize_usage(usage: dict | None) -> dict:
+    """把上游 usage 归一化成 OpenAI 字段；拿不到时回退为 0（保持旧行为）。"""
+    if not isinstance(usage, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+    completion = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+    total = usage.get("total_tokens")
+    if not isinstance(total, int) or total <= 0:
+        total = prompt + completion
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
 
 
 def build_openai_response(
@@ -187,6 +204,7 @@ def build_openai_response(
     tool_calls: list | None = None,
     finish_reason: str = "stop",
     created: int | None = None,
+    usage: dict | None = None,
 ) -> dict:
     """构建 OpenAI 兼容的非流式响应。"""
     message = {"role": "assistant", "content": content}
@@ -204,82 +222,114 @@ def build_openai_response(
             "message": message,
             "finish_reason": finish_reason,
         }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": normalize_usage(usage),
     }
 
 
 async def stream_chat_completion(client: ApiClient, body: dict, model: str) -> StreamingResponse:
     """流式处理聊天请求，返回 SSE 流。
 
-    内部始终使用流式调用上游 API（因为上游不支持非流式），
-    但将完整的响应流式分块返回给客户端。
+    上游增量一到就转发给客户端（真流式，不再等整个响应收完）。
+    上游是阻塞式 http.client，因此放在工作线程里读，通过 asyncio.Queue 回传事件。
     """
     messages = body.get("messages", [])
     temperature = body.get("temperature", 0.7)
     max_tokens = body.get("max_tokens", MAX_TOKENS_DEFAULT)
-    thinking_level = body.get("reasoning_effort") or body.get("thinking_level") or "max"
+    thinking_level = body.get("reasoning_effort") or body.get("thinking_level") or DEFAULT_THINKING_ENV
     tools = body.get("tools")
     tool_choice = body.get("tool_choice")
+    stream_options = body.get("stream_options") or {}
+    include_usage = bool(stream_options.get("include_usage"))
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
     async def generate():
-        try:
-            # 发送 role chunk（OpenAI 协议要求）
-            yield f"data: {json.dumps(build_openai_chunk(chunk_id, model, role='assistant', created=created))}\n\n"
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        sentinel = object()
 
-            # 内部始终流式调用上游
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: client.chat_completion(
+        def worker():
+            """在后台线程里读上游并逐条投递事件，保证增量能立刻转发。"""
+            try:
+                for ev in client.chat_completion_stream(
                     messages=messages,
                     model=model,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    stream=True,  # 上游只支持流式
                     thinking_level=thinking_level,
                     tools=tools,
                     tool_choice=tool_choice,
-                ),
-            )
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, ev)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "error": str(exc)})
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
 
-            if result is None:
-                yield f"data: {json.dumps({'error': 'upstream API returned no content'})}\n\n"
-                yield "data: [DONE]\n\n"
-                return
+        try:
+            # 发送 role chunk（OpenAI 协议要求）
+            yield f"data: {json.dumps(build_openai_chunk(chunk_id, model, role='assistant', created=created))}\n\n"
 
-            full_text = result.get("content", "") if isinstance(result, dict) else result
-            reasoning_text = result.get("reasoning_content", "") if isinstance(result, dict) else ""
-            tool_calls = result.get("tool_calls") if isinstance(result, dict) else None
-            finish_reason = result.get("finish_reason", "stop") if isinstance(result, dict) else "stop"
+            threading.Thread(target=worker, daemon=True).start()
 
-            # 先发送思考内容（reasoning_content）的 delta chunk
-            if reasoning_text:
-                chunk = build_openai_chunk(chunk_id, model, reasoning_content=reasoning_text, created=created)
-                yield f"data: {json.dumps(chunk)}\n\n"
-                await asyncio.sleep(0.02)
+            finish_reason = "stop"
+            final_usage = None
+            saw_reasoning = saw_content = saw_tool_calls = False
 
-            # 发送 tool_calls 的 delta chunk
-            if tool_calls:
-                chunk = build_openai_chunk(chunk_id, model, tool_calls=tool_calls, created=created)
-                yield f"data: {json.dumps(chunk)}\n\n"
-                await asyncio.sleep(0.02)
+            while True:
+                event = await queue.get()
+                if event is sentinel:
+                    break
 
-            # 将完整文本分块发送，模拟流式效果
-            import re
-            tokens = re.split(r'(\s+)', full_text)
-            for token in tokens:
-                if token:
-                    chunk = build_openai_chunk(chunk_id, model, content=token, created=created)
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    await asyncio.sleep(0.02)
+                kind = event.get("type")
 
+                if kind == "delta":
+                    if event.get("reasoning_content"):
+                        saw_reasoning = True
+                        chunk = build_openai_chunk(chunk_id, model, reasoning_content=event["reasoning_content"], created=created)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    if event.get("content"):
+                        saw_content = True
+                        chunk = build_openai_chunk(chunk_id, model, content=event["content"], created=created)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    if event.get("tool_calls"):
+                        saw_tool_calls = True
+                        chunk = build_openai_chunk(chunk_id, model, tool_calls=event["tool_calls"], created=created)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
+                elif kind == "final":
+                    finish_reason = event.get("finish_reason") or finish_reason
+                    final_usage = event.get("usage")
+                    # 兜底：上游全程没吐过增量时，用聚合结果补发一次，避免空响应
+                    if not saw_reasoning and event.get("reasoning_content"):
+                        saw_reasoning = True
+                        chunk = build_openai_chunk(chunk_id, model, reasoning_content=event["reasoning_content"], created=created)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    if not saw_content and event.get("content"):
+                        saw_content = True
+                        chunk = build_openai_chunk(chunk_id, model, content=event["content"], created=created)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    if not saw_tool_calls and event.get("tool_calls"):
+                        saw_tool_calls = True
+                        chunk = build_openai_chunk(chunk_id, model, tool_calls=event["tool_calls"], created=created)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
+                elif kind == "error":
+                    yield f"data: {json.dumps({'error': event.get('error', 'upstream error')})}\n\n"
+
+            usage_payload = normalize_usage(final_usage)
             finish_chunk = build_openai_chunk(
                 chunk_id, model,
                 finish_reason=finish_reason, created=created,
+                usage=usage_payload,
             )
             yield f"data: {json.dumps(finish_chunk)}\n\n"
+
+            # OpenAI 规范：stream_options.include_usage 为真时，再补一个 choices 为空、只带 usage 的收尾块
+            if include_usage:
+                yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [], 'usage': usage_payload})}\n\n"
+
             yield "data: [DONE]\n\n"
 
         except Exception as e:
@@ -389,9 +439,9 @@ async def chat_completions(request: Request):
     if stream:
         return await stream_chat_completion(client, body, model)
 
-    # 非流式模式 — 内部始终流式调用（上游 API 不支持非流式）
+    # 非流式模式 — 上游只支持流式，这里收完再一次性返回
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
             lambda: client.chat_completion(
@@ -403,6 +453,7 @@ async def chat_completions(request: Request):
                 thinking_level=thinking_level,
                 tools=tools,
                 tool_choice=tool_choice,
+                echo=False,   # 服务端不要把回答打到 stdout
             ),
         )
     except Exception as e:
@@ -416,10 +467,12 @@ async def chat_completions(request: Request):
     reasoning = result.get("reasoning_content", "") if isinstance(result, dict) else ""
     tool_calls = result.get("tool_calls") if isinstance(result, dict) else None
     finish_reason = result.get("finish_reason", "stop") if isinstance(result, dict) else "stop"
+    usage = result.get("usage") if isinstance(result, dict) else None
 
     resp_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     return JSONResponse(build_openai_response(resp_id, model, content,
-        reasoning_content=reasoning, tool_calls=tool_calls, finish_reason=finish_reason))
+        reasoning_content=reasoning, tool_calls=tool_calls, finish_reason=finish_reason,
+        usage=usage))
 
 
 # ── Image Generation ───────────────────────────────────────────────────────

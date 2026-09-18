@@ -19,7 +19,8 @@ A featherweight proxy that turns WorkBuddy's internal API into a standard **Open
 - 🧠 **Reasoning content** — `reasoning_content` (thinking process) exposed
 - 🔁 **Multi-turn reasoning replay** — the upstream drops historical `reasoning_content`, so it is folded into `content` before sending
 - 🚀 **Max thinking by default** — deep reasoning even with zero extra params
-- ⚡ **Streaming by default** — SSE, low latency
+- ⚡ **True streaming** — SSE deltas forwarded as they arrive; first-token latency = upstream
+- 📊 **Usage reporting** — `usage` in responses and in the streaming final chunk
 - 🖼️ **Image generation** — text-to-image `/v1/images/generations`, image editing `/v1/images/edits`
 - 🔄 **Auto token refresh** — no manual intervention
 - 🛡️ **Anti-ban protection** — rate limiting, jitter, UA rotation, exponential backoff
@@ -127,6 +128,19 @@ curl https://your-domain/v1/chat/completions \
 ```
 
 `reasoning_effort`: `low` | `medium` | `high` | `max` | `off`
+
+**Streaming with token usage:**
+
+```bash
+-d '{
+  "model": "deepseek-v4-pro",
+  "messages": [{"role": "user", "content": "hi"}],
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}'
+```
+
+With `stream_options.include_usage` set, an extra chunk with `choices: []` and only `usage` is emitted before `[DONE]` (OpenAI spec).
 
 **Tool calling:**
 

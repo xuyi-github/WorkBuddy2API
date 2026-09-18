@@ -414,6 +414,31 @@ def replay_reasoning(messages: list[dict]) -> list[dict]:
     return replayed
 
 
+def _accumulate_tool_calls(acc: dict, tool_calls: list) -> None:
+    """把流式 tool_calls 增量按 index 聚合进 acc（原地修改）。"""
+    for tc in tool_calls:
+        idx = tc.get("index", 0)
+        if idx not in acc:
+            acc[idx] = {
+                "index": idx,
+                "id": None,
+                "type": "function",
+                "function": {"name": None, "arguments": ""},
+            }
+        entry = acc[idx]
+        # id 和 type 通常只在第一个 chunk 出现
+        if tc.get("id"):
+            entry["id"] = tc["id"]
+        if tc.get("type"):
+            entry["type"] = tc["type"]
+        # function name 在第一个 chunk
+        if tc.get("function", {}).get("name"):
+            entry["function"]["name"] = tc["function"]["name"]
+        # arguments 逐步拼接
+        if tc.get("function", {}).get("arguments"):
+            entry["function"]["arguments"] += tc["function"]["arguments"]
+
+
 # ── HTTP Client ────────────────────────────────────────────────────────────
 class ApiClient:
     """轻量 HTTP 客户端，内置反封号保护措施。"""
@@ -549,28 +574,19 @@ class ApiClient:
 
         raise RuntimeError("Token 已过期且刷新失败。请重新登录 WorkBuddy。")
 
-    def chat_completion(
+    def _build_chat_body(
         self,
         messages: list[dict],
-        model: str = "deepseek-v3",
-        temperature: float = 0.7,
-        max_tokens: int = 8192,
-        stream: bool = True,
-        thinking_level: str | None = None,
-        tools: list[dict] | None = None,
-        tool_choice: str | dict | None = None,
-    ) -> dict | None:
-        """发送聊天请求，返回 {"content": str, "reasoning_content": str, "tool_calls": list} 或 None。
-
-        Args:
-            thinking_level: 思考深度 - "off"|"low"|"medium"|"high"|"max"。
-                            None 表示不设置（使用模型默认值）。
-            tools: OpenAI 标准 tools 列表 [{"type": "function", "function": {...}}]。
-            tool_choice: "auto"|"none"|"required"|{"type": "function", "function": {"name": "..."}}。
-        """
-        self.ensure_valid_token()
-
-        # 构建请求体（对齐真实客户端字段顺序）
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        stream: bool,
+        thinking_level: str | None,
+        tools: list[dict] | None,
+        tool_choice: str | dict | None,
+    ) -> dict:
+        """构建上游 /v2/chat/completions 的请求体（流式与非流式共用）。"""
+        # 对齐真实客户端字段顺序
         body: dict = {
             "model": model,
             # 上游会丢弃 assistant 消息上的 reasoning_content，需先折叠进 content
@@ -598,6 +614,39 @@ class ApiClient:
         if tool_choice is not None:
             body["tool_choice"] = tool_choice
 
+        return body
+
+    def chat_completion(
+        self,
+        messages: list[dict],
+        model: str = "deepseek-v3",
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+        stream: bool = True,
+        thinking_level: str | None = None,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+        echo: bool = True,
+    ) -> dict | None:
+        """发送聊天请求（收完整个响应后一次性返回）。
+
+        返回 {"content": str, "reasoning_content": str, "tool_calls": list,
+              "finish_reason": str, "usage": dict | None}；失败返回 None。
+
+        Args:
+            thinking_level: 思考深度 - "off"|"low"|"medium"|"high"|"max"。
+                            None 表示不设置（使用模型默认值）。
+            tools: OpenAI 标准 tools 列表 [{"type": "function", "function": {...}}]。
+            tool_choice: "auto"|"none"|"required"|{"type": "function", "function": {"name": "..."}}。
+            echo: 是否把回答实时打印到 stdout（CLI 用；服务端应传 False）。
+
+        需要边收边转发（真流式）时用 chat_completion_stream()。
+        """
+        self.ensure_valid_token()
+        body = self._build_chat_body(
+            messages, model, temperature, max_tokens, stream,
+            thinking_level, tools, tool_choice,
+        )
         headers = self._build_headers(stream=stream, model=model)
 
         # 频率限制：等待安全间隔
@@ -650,19 +699,22 @@ class ApiClient:
                     return None
 
                 if stream:
-                    return self._parse_sse_stream(resp)
+                    return self._parse_sse_stream(resp, echo=echo)
                 else:
                     data = json.loads(resp.read().decode("utf-8"))
                     self._reset_connection()
                     choices = data.get("choices", [])
                     if choices:
                         message = choices[0].get("message", {})
-                        return {
+                        result = {
                             "content": message.get("content", ""),
                             "reasoning_content": message.get("reasoning_content", ""),
                             "tool_calls": message.get("tool_calls"),
                             "finish_reason": choices[0].get("finish_reason", "stop"),
                         }
+                        if isinstance(data.get("usage"), dict):
+                            result["usage"] = data["usage"]
+                        return result
                     return None
 
             except (http.client.HTTPException, ConnectionError, OSError, TimeoutError) as e:
@@ -679,6 +731,148 @@ class ApiClient:
         if last_error:
             print(f"[!] 所有重试均失败。最后错误: {last_error}", file=sys.stderr)
         return None
+
+    def chat_completion_stream(
+        self,
+        messages: list[dict],
+        model: str = "deepseek-v3",
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+        thinking_level: str | None = None,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+    ):
+        """流式调用上游，边收边产出事件（首字延迟 = 上游首字延迟，不再整体缓冲）。
+
+        yield {"type": "delta", "content": str, "reasoning_content": str,
+               "tool_calls": list | None, "finish_reason": str}
+              {"type": "usage", "usage": {...}}
+              {"type": "error", "error": str}
+              {"type": "final", "content": str, "reasoning_content": str,
+               "tool_calls": list | None, "finish_reason": str, "usage": dict | None}
+
+        重试只在「尚未产出任何增量」时进行，避免把内容重复发给客户端。
+        """
+        self.ensure_valid_token()
+        body = self._build_chat_body(
+            messages, model, temperature, max_tokens, True,
+            thinking_level, tools, tool_choice,
+        )
+
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            headers = self._build_headers(stream=True, model=model)
+            self.rate_limiter.wait()
+
+            emitted = False
+            full_text = ""
+            thinking_text = ""
+            finish_reason = "stop"
+            usage = None
+            tool_calls_acc: dict[int, dict] = {}
+
+            try:
+                conn = self._get_connection()
+                conn.request(
+                    "POST",
+                    CHAT_COMPLETIONS_PATH,
+                    body=json.dumps(body),
+                    headers=headers,
+                )
+                resp = conn.getresponse()
+
+                if resp.status != 200:
+                    error_body = resp.read(2048).decode("utf-8", errors="replace")
+                    self._reset_connection()
+
+                    # 401 → 刷新 token 后重试
+                    if resp.status == 401 and attempt < MAX_RETRIES - 1:
+                        print("[!] 收到 401，尝试刷新 token 后重试...", file=sys.stderr)
+                        if self.refresh_token():
+                            continue
+                        print(f"[!] 401 错误体: {error_body[:300]}", file=sys.stderr)
+
+                    # 429 / 5xx → 指数退避重试
+                    if (resp.status == 429 or resp.status >= 500) and attempt < MAX_RETRIES - 1:
+                        backoff = min(BACKOFF_BASE ** (attempt + 1) + random.uniform(0, 2), MAX_BACKOFF)
+                        print(f"[!] 上游 {resp.status}，{backoff:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                        time.sleep(backoff)
+                        continue
+
+                    print(f"[!] API 错误 {resp.status}: {error_body[:500]}", file=sys.stderr)
+                    yield {"type": "error", "error": f"{resp.status}: {error_body[:200]}"}
+                    return
+
+                try:
+                    for event in self._iter_sse_events(resp):
+                        kind = event["type"]
+
+                        if kind == "usage":
+                            usage = event["usage"]
+                            continue
+
+                        if kind == "done":
+                            finish_reason = event.get("finish_reason", finish_reason)
+                            continue
+
+                        if kind != "delta":
+                            continue
+
+                        if event.get("tool_calls"):
+                            _accumulate_tool_calls(tool_calls_acc, event["tool_calls"])
+                        if event.get("reasoning_content"):
+                            thinking_text += event["reasoning_content"]
+                        if event.get("content"):
+                            full_text += event["content"]
+                        if event.get("finish_reason"):
+                            finish_reason = event["finish_reason"]
+
+                        emitted = True
+                        yield {
+                            "type": "delta",
+                            "content": event.get("content") or "",
+                            "reasoning_content": event.get("reasoning_content") or "",
+                            "tool_calls": event.get("tool_calls"),
+                            "finish_reason": finish_reason,
+                        }
+                finally:
+                    self._reset_connection()
+
+                if not full_text and thinking_text:
+                    full_text = thinking_text
+
+                final = {
+                    "type": "final",
+                    "content": full_text,
+                    "reasoning_content": thinking_text,
+                    "finish_reason": finish_reason,
+                    "usage": usage,
+                }
+                if tool_calls_acc:
+                    final["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+                yield final
+                return
+
+            except (http.client.HTTPException, ConnectionError, OSError, TimeoutError) as e:
+                self._reset_connection()
+                last_error = str(e)
+                if emitted:
+                    # 已经吐过内容，重试会导致重复，直接报错收尾
+                    print(f"[!] 流中断: {e}", file=sys.stderr)
+                    yield {"type": "error", "error": f"stream interrupted: {e}"}
+                    return
+                if attempt < MAX_RETRIES - 1:
+                    backoff = min(BACKOFF_BASE ** (attempt + 1) + random.uniform(0, 1), MAX_BACKOFF)
+                    print(f"[!] 连接错误，{backoff:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES}): {e}", file=sys.stderr)
+                    time.sleep(backoff)
+                    continue
+                print(f"[!] 请求失败: {e}", file=sys.stderr)
+                yield {"type": "error", "error": str(e)}
+                return
+
+        if last_error:
+            print(f"[!] 所有重试均失败。最后错误: {last_error}", file=sys.stderr)
+        yield {"type": "error", "error": last_error or "所有重试均失败"}
 
     def image_generation(
         self,
@@ -909,119 +1103,159 @@ class ApiClient:
             pass
         return "image/png"
 
-    def _parse_sse_stream(self, resp: http.client.HTTPResponse) -> dict | None:
-        """解析 SSE 流式响应，返回 {"content": str, "reasoning_content": str, "tool_calls": list, "finish_reason": str}。
+    def _iter_sse_events(self, resp: http.client.HTTPResponse):
+        """解析上游 SSE 流并逐个产出事件（本方法不做任何打印）。
 
-        收集 reasoning_content、content 和 tool_calls（流式增量拼接），分别返回。
+        事件类型：
+          {"type": "conversation_id", "id": str}
+          {"type": "usage", "usage": {...}}
+          {"type": "delta", "content": str, "reasoning_content": str,
+           "tool_calls": list | None, "finish_reason": str}
+          {"type": "done", "finish_reason": str}
+        """
+        buffer = b""
+        current_event = ""  # 当前 SSE event 类型
+        finish_reason = "stop"
 
+        while True:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            buffer += chunk
+
+            while b"\n" in buffer:
+                line_end = buffer.index(b"\n")
+                line = buffer[:line_end].decode("utf-8", errors="replace").strip()
+                buffer = buffer[line_end + 1:]
+
+                # SSE comment — skip
+                if not line or line.startswith(":"):
+                    continue
+
+                # SSE event type line
+                if line.startswith("event:"):
+                    current_event = line[6:].strip()
+                    continue
+
+                if not line.startswith("data:"):
+                    continue
+
+                data_str = line[6:].strip()
+
+                # conversationId 事件
+                if current_event == "conversationId":
+                    current_event = ""
+                    if data_str.startswith("conv-"):
+                        self._conversation_id = data_str
+                        yield {"type": "conversation_id", "id": data_str}
+                    continue
+
+                # 流结束
+                if data_str == "[DONE]":
+                    current_event = ""
+                    yield {"type": "done", "finish_reason": finish_reason}
+                    return
+
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    current_event = ""
+                    continue
+
+                current_event = ""
+
+                # usage（上游每个 chunk 都可能带，取最后一个）
+                usage = data.get("usage")
+                if isinstance(usage, dict):
+                    yield {"type": "usage", "usage": usage}
+
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+
+                delta = choice.get("delta") or {}
+                content = delta.get("content") or ""
+                reasoning = delta.get("reasoning_content") or ""
+                tool_calls = delta.get("tool_calls")
+
+                if content or reasoning or tool_calls:
+                    yield {
+                        "type": "delta",
+                        "content": content,
+                        "reasoning_content": reasoning,
+                        "tool_calls": tool_calls,
+                        "finish_reason": finish_reason,
+                    }
+
+        yield {"type": "done", "finish_reason": finish_reason}
+
+    def _parse_sse_stream(
+        self,
+        resp: http.client.HTTPResponse,
+        echo: bool = True,
+    ) -> dict | None:
+        """消费 SSE 流聚合成完整结果，返回 {"content": str, "reasoning_content": str,
+        "tool_calls": list, "finish_reason": str, "usage": dict | None}。
+
+        echo=True 保留 CLI 的实时打印；服务端路径传 echo=False。
         提取 conversationId 并存储，供后续请求回传。
         """
         full_text = ""
         thinking_text = ""
         finish_reason = "stop"
+        usage = None
         chunk_count = 0
-        current_event = ""  # 当前 SSE event 类型
 
         # 流式 tool_calls 增量累积（按 index 聚合）
         tool_calls_acc: dict[int, dict] = {}
 
         try:
-            buffer = b""
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                buffer += chunk
+            for event in self._iter_sse_events(resp):
+                kind = event["type"]
 
-                while b"\n" in buffer:
-                    line_end = buffer.index(b"\n")
-                    line = buffer[:line_end].decode("utf-8", errors="replace").strip()
-                    buffer = buffer[line_end + 1:]
+                if kind == "usage":
+                    usage = event["usage"]
+                    continue
 
-                    # SSE comment — skip
-                    if not line or line.startswith(":"):
-                        continue
+                if kind == "done":
+                    finish_reason = event.get("finish_reason", finish_reason)
+                    continue
 
-                    # SSE event type line
-                    if line.startswith("event:"):
-                        current_event = line[6:].strip()
-                        continue
+                if kind != "delta":
+                    continue
 
-                    if line.startswith("data:"):
-                        data_str = line[6:].strip()
+                if event.get("tool_calls"):
+                    _accumulate_tool_calls(tool_calls_acc, event["tool_calls"])
 
-                        # conversationId 事件
-                        if current_event == "conversationId":
-                            if data_str.startswith("conv-"):
-                                self._conversation_id = data_str
-                            current_event = ""
-                            continue
+                if event.get("reasoning_content"):
+                    thinking_text += event["reasoning_content"]
 
-                        # 流结束
-                        if data_str == "[DONE]":
-                            if thinking_text and not full_text:
-                                full_text = thinking_text
-                                print(thinking_text)
-                            print()
-                            break
+                if event.get("finish_reason"):
+                    finish_reason = event["finish_reason"]
 
-                        try:
-                            data = json.loads(data_str)
-                            choices = data.get("choices", [])
-                            if choices:
-                                delta = choices[0].get("delta", {})
-                                content = delta.get("content", "")
-                                reasoning = delta.get("reasoning_content", "")
-                                tool_calls = delta.get("tool_calls")
+                content = event.get("content")
+                if not content:
+                    continue
 
-                                # 累积 tool_calls（流式增量拼接）
-                                if tool_calls:
-                                    for tc in tool_calls:
-                                        idx = tc.get("index", 0)
-                                        if idx not in tool_calls_acc:
-                                            tool_calls_acc[idx] = {
-                                                "index": idx,
-                                                "id": None,
-                                                "type": "function",
-                                                "function": {"name": None, "arguments": ""},
-                                            }
-                                        acc = tool_calls_acc[idx]
-                                        # id 和 type 通常只在第一个 chunk 出现
-                                        if tc.get("id"):
-                                            acc["id"] = tc["id"]
-                                        if tc.get("type"):
-                                            acc["type"] = tc["type"]
-                                        # function name 在第一个 chunk
-                                        if tc.get("function", {}).get("name"):
-                                            acc["function"]["name"] = tc["function"]["name"]
-                                        # arguments 逐步拼接
-                                        if tc.get("function", {}).get("arguments"):
-                                            acc["function"]["arguments"] += tc["function"]["arguments"]
-
-                                if reasoning:
-                                    thinking_text += reasoning
-
-                                if content:
-                                    chunk_count += 1
-                                    if chunk_count == 1:
-                                        if thinking_text and len(thinking_text) > 20:
-                                            print(f"\n  [思考: {thinking_text[:80]}...]\n", file=sys.stderr)
-                                        print()
-                                    sys.stdout.write(content)
-                                    sys.stdout.flush()
-                                    full_text += content
-
-                                finish_reason = choices[0].get("finish_reason", finish_reason)
-                        except json.JSONDecodeError:
-                            pass
-
-                        current_event = ""
-
+                chunk_count += 1
+                if chunk_count == 1 and echo:
+                    if thinking_text and len(thinking_text) > 20:
+                        print(f"\n  [思考: {thinking_text[:80]}...]\n", file=sys.stderr)
+                    print()
+                if echo:
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
+                full_text += content
         finally:
             self._reset_connection()
 
         if not full_text and thinking_text:
-            print(thinking_text)
+            if echo:
+                print(thinking_text)
             full_text = thinking_text
 
         if not full_text and not thinking_text and not tool_calls_acc:
@@ -1034,6 +1268,8 @@ class ApiClient:
         }
         if tool_calls_acc:
             result["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+        if usage:
+            result["usage"] = usage
         return result
 
 

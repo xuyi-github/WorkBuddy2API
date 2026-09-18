@@ -22,7 +22,8 @@
 | 轮次 | 提交 | 主题 |
 |---|---|---|
 | 第一轮 | `bcf7650` | 修复多轮对话中历史思考被丢弃；接入 `tokens.json`；Windows 桌面端 auth 路径 |
-| 第二轮 | 本次 | 一键启动脚本；移除 4 个上游已下架模型；文档校正（CC Switch 接入路线） |
+| 第二轮 | `df26a8c` | 一键启动脚本；移除 4 个上游已下架模型；文档校正（CC Switch 接入路线） |
+| 第三轮 | 本次 | 真流式转发（不再整体缓冲）；`usage` 透出（token 级可观测） |
 
 ---
 
@@ -89,7 +90,7 @@
 
 ---
 
-## 第二轮：一键启动 + 模型清单校正 + 文档修正（本次）
+## 第二轮：一键启动 + 模型清单校正 + 文档修正（`df26a8c`）
 
 ### 1. 一键启动脚本
 
@@ -146,10 +147,58 @@ PORT=9000 ./start.sh
 
 ---
 
+## 第三轮：真流式 + `usage` 透出（本次）
+
+上游本项目自身的两个表现层问题（不是上游腾讯的），本轮修掉。
+
+### 1. 真流式转发
+
+**修复前**：`server.py` 用 `run_in_executor` 等 `chat_completion()` 收完**整个**上游响应，
+再按空白切块、每块 `sleep(0.02)` 假装流式 —— 表现为「首字很慢，然后整段一次性刷出」。
+
+**修复后**：上游增量一到就转发。
+
+| 文件 | 位置 | 改动 |
+|---|---|---|
+| `codebuddy_direct_api.py` | `:417` | `_accumulate_tool_calls()`：流式 tool_calls 增量聚合（两条路径共用） |
+| `codebuddy_direct_api.py` | `:577` | `_build_chat_body()`：请求体构造抽出，流式 / 非流式共用 |
+| `codebuddy_direct_api.py` | `:735` | `chat_completion_stream()`：边收边 yield 的真流式接口 |
+| `codebuddy_direct_api.py` | `:1106` | `_iter_sse_events()`：纯 SSE 解析器，产出 delta / usage / done 事件 |
+| `codebuddy_direct_api.py` | `:1196` | `_parse_sse_stream()` 改为消费事件流，新增 `echo` 参数 |
+| `server.py` | `:236` | 上游读取移入后台线程 + `asyncio.Queue`，事件到达即写 SSE |
+
+重试只在「尚未产出任何增量」时进行（401 刷新 token / 429 / 5xx 退避）；
+已经吐过内容再重试会导致重复，因此直接报错收尾。
+
+**实测**（`deepseek-v4-pro`，裸 socket 计时）：69 次 TCP 推送、跨度 2.95s，
+首个增量 1.408s、末次 2.952s —— 确认不再整体缓冲。
+
+### 2. `usage` 透出
+
+上游每个 SSE chunk 都带 `usage`，但原实现丢弃了它，`/v1/chat/completions` 永远返回
+`{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}`。
+
+现在：
+
+- 非流式：`usage` 直接透出
+- 流式：`finish_reason` 收尾块带 `usage`；`stream_options.include_usage` 为真时，
+  按 OpenAI 规范再补一个 `choices: []` 的纯 usage 块（`server.py:174` 的 `normalize_usage()`，
+  缺失时回退为 0，保持旧行为）
+
+**顺带收益**：多轮思考回放现在可以做 token 级断言 —— A/B 的 `prompt_tokens`
+70（无 reasoning）vs 90（带 reasoning），差值 20 正是折叠进去的思考。
+
+### 3. 顺手修的既有 bug
+
+`DEFAULT_THINKING` 环境变量此前被 `server.py` 读取却从未生效（流式路径默认值写死 `"max"`），
+现已改为使用 `DEFAULT_THINKING_ENV`。
+
 ## 与上游同步时注意
 
 - `codebuddy_direct_api.py` 的改动集中在 `replay_reasoning()` 及其调用点，
   上游若重构 `chat_completion()` 的请求体组装，需重新确认折叠逻辑仍在发送前生效。
 - `KNOWN_CHAT_MODELS` / `THINKING_CAPABLE_MODELS` 是单一数据源（`/v1/models` 与 CLI 共用），
   上游新增模型时直接合并即可，注意别把已下架的 4 个模型带回来。
-- 自检：`python docs/verify_reasoning_replay.py`（离线，期望 `7/7 passed`）。
+- `chat_completion()` 仍是「收完再返回」的兼容接口；服务端流式走 `chat_completion_stream()`。
+  上游若改了 SSE 事件名（`event: conversationId`）或 `[DONE]` 语义，改 `_iter_sse_events()` 一处即可。
+- 自检：`python docs/verify_reasoning_replay.py`（离线，期望 `9/9 passed`）。

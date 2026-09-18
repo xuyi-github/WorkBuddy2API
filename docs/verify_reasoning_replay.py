@@ -5,7 +5,7 @@
 
     python docs/verify_reasoning_replay.py
 
-不需要 token，也不访问网络：上游 HTTP 层在用例 9 中被替换为内存 fake。
+不需要 token，也不访问网络：涉及上游的用例把 HTTP 层替换成了内存 fake。
 退出码 0 表示全部通过，1 表示有用例失败。
 """
 from __future__ import annotations
@@ -145,6 +145,91 @@ def chat_completion_sends_folded_messages():
     assert result == {"content": "ok", "reasoning_content": "",
                       "tool_calls": None, "finish_reason": "stop"}, result
     return repr(sent[0]["content"])
+
+
+class _FakeSSEResponse:
+    """把一段 SSE 字节流包成 http.client.HTTPResponse 的最小替身。"""
+
+    status = 200
+
+    def __init__(self, data: bytes):
+        self._buf = data
+
+    def read(self, size: int = -1) -> bytes:
+        if not self._buf:
+            return b""
+        n = size if isinstance(size, int) and size > 0 else len(self._buf)
+        chunk, self._buf = self._buf[:n], self._buf[n:]
+        return chunk
+
+
+class _FakeConnection:
+    def __init__(self, data: bytes):
+        self.body = None
+        self._data = data
+
+    def request(self, method, path, body=None, headers=None):
+        self.body = json.loads(body)
+
+    def getresponse(self):
+        return _FakeSSEResponse(self._data)
+
+
+def _sse_client(payload: bytes):
+    """构造一个上游连接被替换成内存 SSE 字节流的 ApiClient。"""
+    client = m.ApiClient.__new__(m.ApiClient)
+    client._conversation_id = None
+    client.rate_limiter = types.SimpleNamespace(wait=lambda: 0.0)
+    client.ensure_valid_token = lambda: None
+    client._reset_connection = lambda: None
+    conn = _FakeConnection(payload)
+    client._get_connection = lambda: conn
+    client._build_headers = lambda stream=True, model=None: {}
+    return client, conn
+
+
+SSE_PAYLOAD = (
+    "event: conversationId\ndata: conv-abc123\n\n"
+    'data: {"choices":[{"delta":{"reasoning_content":"想"},"finish_reason":null}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"你"}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"好"}}],'
+    '"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    "data: [DONE]\n\n"
+).encode("utf-8")
+
+
+@case
+def iter_sse_events_emits_deltas_usage_and_done():
+    """SSE 解析器：记录 conversationId，按序产出 delta / usage / done，且不打印。"""
+    client, _ = _sse_client(SSE_PAYLOAD)
+    events = list(client._iter_sse_events(_FakeSSEResponse(SSE_PAYLOAD)))
+    kinds = [e["type"] for e in events]
+    assert kinds == ["conversation_id", "delta", "delta", "usage", "delta", "done"], kinds
+    assert client._conversation_id == "conv-abc123", client._conversation_id
+    assert events[0]["id"] == "conv-abc123", events[0]
+    assert events[1]["reasoning_content"] == "想", events[1]
+    assert events[3]["usage"]["total_tokens"] == 12, events[3]
+    assert events[4]["content"] == "好", events[4]
+    assert events[-1]["finish_reason"] == "stop", events[-1]
+    return "conversation_id / delta / usage / done 按序产出"
+
+
+@case
+def chat_completion_stream_yields_deltas_then_final():
+    """流式接口：增量逐个 yield，末尾 final 带聚合结果与 usage。"""
+    client, conn = _sse_client(SSE_PAYLOAD)
+    events = list(client.chat_completion_stream(
+        messages=[{"role": "user", "content": "hi"}], model="deepseek-v3"))
+    kinds = [e["type"] for e in events]
+    assert kinds == ["delta", "delta", "delta", "final"], kinds
+    final = events[-1]
+    assert final["content"] == "你好", final["content"]
+    assert final["reasoning_content"] == "想", final["reasoning_content"]
+    assert final["finish_reason"] == "stop", final
+    assert final["usage"]["prompt_tokens"] == 10, final["usage"]
+    assert conn.body["stream"] is True, conn.body
+    return "3 deltas + final(usage total_tokens=12)"
 
 
 def main() -> int:

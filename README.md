@@ -19,7 +19,8 @@
 - 🧠 **思考内容输出** — 支持 `reasoning_content`（推理过程）透传
 - 🔁 **多轮思考回放** — 上游会丢弃历史 `reasoning_content`，发送前自动折叠进 `content`
 - 🚀 **默认最高深度思考** — 不传参数也能拿到深度推理结果
-- ⚡ **默认流式输出** — SSE 边想边答，延迟更低
+- ⚡ **真流式输出** — SSE 增量到达即转发，首字延迟 = 上游首字延迟
+- 📊 **Token 用量透出** — 响应与流式收尾块带 `usage`，便于成本统计
 - 🖼️ **AI 生图** — 文生图 `/v1/images/generations`、图生图 `/v1/images/edits`
 - 🔄 **Token 自动刷新** — 过期自动刷新，无需手动干预
 - 🛡️ **反封号保护** — 内置限速、随机延迟、UA 轮换、指数退避
@@ -133,6 +134,19 @@ curl https://your-domain/v1/chat/completions \
 ```
 
 `reasoning_effort` 可选值：`low` | `medium` | `high` | `max` | `off`
+
+**流式 + token 用量：**
+
+```bash
+-d '{
+  "model": "deepseek-v4-pro",
+  "messages": [{"role": "user", "content": "你好"}],
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}'
+```
+
+`stream_options.include_usage` 为真时，会在 `[DONE]` 前多补一个 `choices: []`、只带 `usage` 的收尾块（OpenAI 规范）。
 
 **工具调用（tools 透传）：**
 
