@@ -11,7 +11,11 @@
 
 ## 这是什么？
 
-一个超轻量的代理服务：你在 WorkBuddy 里能用的所有模型（DeepSeek、Kimi、GLM、混元、MiniMax……），现在都能通过标准的 OpenAI 接口调出来。任何支持 OpenAI API 的工具（Claude Code、各类客户端、脚本……）都能直接用上 WorkBuddy 的模型。
+一个超轻量的代理服务：你在 WorkBuddy 里能用的所有模型（DeepSeek、Kimi、GLM、混元、MiniMax……），现在都能通过标准的 OpenAI 接口调出来。任何支持 OpenAI API 的工具（各类客户端、SDK、脚本……）都能直接用上 WorkBuddy 的模型。
+
+> ⚠️ 例外：**Claude Code 不能用**。上游网关会按请求内容识别客户端身份，Claude Code 的系统提示词
+> 会命中风控（`code 11128`，请求被安全策略拦截）。排查过程见
+> [docs/2026-09-23_upstream-11128-claude-code-block.md](docs/2026-09-23_upstream-11128-claude-code-block.md)。
 
 ## 特性一览
 
@@ -51,6 +55,10 @@ cat ~/Library/Application\ Support/CodeBuddyExtension/Data/Public/auth/workbuddy
 ./start.sh                      # 默认 8000 端口
 PORT=9000 ./start.sh
 ```
+
+> **API_KEY 不用手动设**：一键启动脚本按「环境变量 → 项目根目录 `apikey.local` →
+> 自动生成并写入 `apikey.local`」取值，启动时把最终 key 打印在 banner 里，
+> 抄进 CC Switch 的 apiKey 即可。该文件已在 `.gitignore` 中，别提交。
 
 也可以手动启动：
 
@@ -181,6 +189,9 @@ curl https://your-domain/v1/images/edits \
 ## 可用模型
 
 ```
+# 上游 Auto
+auto                                      （由上游路由到具体模型，实测落到混元）
+
 # DeepSeek
 deepseek-v3  deepseek-v3-0324  deepseek-v3-0324-lkeap
 deepseek-v3-1-lkeap  deepseek-r1  deepseek-r1-0528-lkeap
@@ -209,10 +220,12 @@ hunyuan-image-v3.0-art                    （文生图·艺术风格）
 hunyuan-image-v2.0-general-edit           （图生图）
 ```
 
-> 也可以通过 `GET /v1/models` 实时获取完整模型列表。
+> 也可以通过 `GET /v1/models` 实时获取完整模型列表（调用需带 `Authorization: Bearer <API_KEY>`）。
 
-> 模型清单已按 2026-09-18 的上游实测校正：移除了已下架的 4 个模型
-> （`deepseek-r1-0528`、`deepseek-v3-1`、`glm-4.7`、`glm-5.0`），详见 [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md)。
+> 模型清单按上游 `/v2/chat/completions` 实测维护，最后一次全量复测为 **2026-09-23**：
+> 清单内 24/24 可用。注意上游 `/v3/config`（客户端模型选择器读的目录）**比可调用
+> 清单陈旧得多**——本次探测的 21 个未收录候选里 17 个已下架、3 个是代码补全类非对话
+> 模型，只有 `auto` 可用，故只补了它。详见 [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md)。
 
 ## API 端点
 
@@ -239,12 +252,19 @@ codebuddy-api-server/
 
 ## 在 Codex / Claude Code 中使用
 
-**可以接入，本项目不需要改代码。**
+**Codex 可以接入（本项目不需要改代码）；Claude Code 不行。**
 
 Codex 0.155.0 只支持 Responses API（`wire_api = "responses"`），本项目只提供
 `/v1/chat/completions`。协议差异由 **CC Switch 的本地代理**承担：把本项目作为
 `apiFormat = openai_chat` 的 provider 加进 CC Switch，CC Switch 就会把 Codex 的 Responses
-请求 / Claude Code 的 Anthropic 请求转换成 Chat Completions 再转发给本项目。
+请求转换成 Chat Completions 再转发给本项目。
+
+> ⚠️ 同一条路**不能给 Claude Code 走**：Claude Code 的每个请求都带
+> `You are Claude Code, Anthropic's official CLI for Claude.` 这句系统提示词，上游按内容
+> 识别客户端身份后返回 `code 11128`（请求被安全策略拦截），换 header / key / 模型都无效
+> —— 变量只在请求内容里。详见
+> [docs/2026-09-23_upstream-11128-claude-code-block.md](docs/2026-09-23_upstream-11128-claude-code-block.md)，
+> 那篇里也给了「中性 system → 200、CC 身份句 → 400」的复现脚本。
 
 ```text
 启动本项目 ( .\start.ps1 )
@@ -254,7 +274,8 @@ CC Switch 新增 provider:  apiFormat = openai_chat
                           base_url = http://127.0.0.1:8000/v1
         |
         v
-切换供应商  ->  Codex (走 127.0.0.1:10001) / Claude Code 即可使用
+切换供应商  ->  Codex (走 127.0.0.1:10001) 即可使用
+                （Claude Code 会被上游 11128 拦截，见上）
 ```
 
 字段填法、验证步骤与排错见 [docs/codex-integration.md](docs/codex-integration.md)。
@@ -267,6 +288,7 @@ CC Switch 新增 provider:  apiFormat = openai_chat
 - [docs/README.md](docs/README.md) —— 文档索引
 - [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md) —— 本 fork 相对上游的改动记录
 - [思考回放交接文档](docs/2026-09-18_reasoning-replay-handoff.md) —— 根因、修复、真实上游验证与待办
+- [上游 11128 拦截 Claude Code](docs/2026-09-23_upstream-11128-claude-code-block.md) —— 排查过程、A/B 证据、结论与替代方案
 - [Codex / Claude Code 接入说明](docs/codex-integration.md) —— 经 CC Switch 协议转换接入
 - 自检：`python docs/verify_reasoning_replay.py`（离线）、`python docs/probe_reasoning_replay.py replay|models`（真实链路）
 

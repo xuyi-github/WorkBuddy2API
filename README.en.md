@@ -11,7 +11,11 @@ Wrap WorkBuddy's internal API into an **OpenAI-compatible REST API** — deploy 
 
 ## What is this?
 
-A featherweight proxy that turns WorkBuddy's internal API into a standard **OpenAI-compatible REST API**. Every model you can use in WorkBuddy — DeepSeek, Kimi, GLM, Hunyuan, MiniMax and more — becomes available through the familiar OpenAI interface. Any tool that speaks OpenAI API (Claude Code, custom clients, scripts…) can now drive WorkBuddy models directly.
+A featherweight proxy that turns WorkBuddy's internal API into a standard **OpenAI-compatible REST API**. Every model you can use in WorkBuddy — DeepSeek, Kimi, GLM, Hunyuan, MiniMax and more — becomes available through the familiar OpenAI interface. Any tool that speaks OpenAI API (custom clients, SDKs, scripts…) can now drive WorkBuddy models directly.
+
+> ⚠️ One exception: **Claude Code will not work.** The upstream gateway fingerprints the client by
+> request *content*, and Claude Code's system prompt trips it — you get `code 11128`,
+> "blocked by security policy". Investigation: [docs/2026-09-23_upstream-11128-claude-code-block.md](docs/2026-09-23_upstream-11128-claude-code-block.md).
 
 ## Highlights
 
@@ -51,6 +55,11 @@ One-command start (installs deps if needed, pre-checks the token):
 ./start.sh                      # defaults to port 8000
 PORT=9000 ./start.sh
 ```
+
+> **You don't need to set `API_KEY` yourself**: the start scripts resolve it as
+> "env var → `apikey.local` in the project root → generate one and write it to `apikey.local`",
+> and print the effective key in the startup banner — copy it into CC Switch's apiKey field.
+> The file is already in `.gitignore`; don't commit it.
 
 Or start it manually:
 
@@ -175,6 +184,9 @@ curl https://your-domain/v1/images/edits \
 ## Available Models
 
 ```
+# Upstream Auto
+auto                                      (routed upstream; lands on Hunyuan in practice)
+
 # DeepSeek
 deepseek-v3  deepseek-v3-0324  deepseek-v3-0324-lkeap
 deepseek-v3-1-lkeap  deepseek-r1  deepseek-r1-0528-lkeap
@@ -203,11 +215,14 @@ hunyuan-image-v3.0-art                    (text-to-image, artistic style)
 hunyuan-image-v2.0-general-edit           (image-to-image)
 ```
 
-> You can also get the full model list anytime via `GET /v1/models`.
+> You can also get the full model list anytime via `GET /v1/models`
+> (requires `Authorization: Bearer <API_KEY>`).
 
-> The list was corrected against a live upstream check on 2026-09-18: four models no longer served
-> upstream were removed (`deepseek-r1-0528`, `deepseek-v3-1`, `glm-4.7`, `glm-5.0`). See
-> [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md).
+> The list is maintained against live upstream checks; the last full re-check was **2026-09-23**
+> (24/24 listed models usable). Note the upstream `/v3/config` catalog that the client's model
+> picker reads is **far staler** than what is actually callable — of the 21 unlisted candidates,
+> 17 are retired and 3 are code-completion (non-chat) models; only `auto` worked, so it is the
+> only addition. See [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md).
 
 ## API Endpoints
 
@@ -234,12 +249,19 @@ codebuddy-api-server/
 
 ## Using with Codex / Claude Code
 
-**It works, and this project needs no code changes.**
+**Codex works (this project needs no code changes); Claude Code does not.**
 
 Codex 0.155.0 only speaks the Responses API (`wire_api = "responses"`), while this project only
 exposes `/v1/chat/completions`. The gap is bridged by **CC Switch's local proxy**: add this server
-as a provider with `apiFormat = openai_chat`, and CC Switch converts Codex's Responses requests /
-Claude Code's Anthropic requests into Chat Completions before forwarding them here.
+as a provider with `apiFormat = openai_chat`, and CC Switch converts Codex's Responses requests
+into Chat Completions before forwarding them here.
+
+> ⚠️ The same route **must not be used for Claude Code**: every Claude Code request carries
+> `You are Claude Code, Anthropic's official CLI for Claude.` in its system prompt, and the
+> upstream fingerprints that content and answers `code 11128` ("blocked by security policy").
+> Changing headers / keys / models does not help — the only variable is the request content.
+> See [docs/2026-09-23_upstream-11128-claude-code-block.md](docs/2026-09-23_upstream-11128-claude-code-block.md)
+> for the A/B evidence, plus a repro script (neutral system → 200, CC identity line → 400).
 
 ```text
 Start this server ( .\start.ps1 )
@@ -249,7 +271,8 @@ CC Switch: add provider  apiFormat = openai_chat
                          base_url = http://127.0.0.1:8000/v1
         |
         v
-Switch provider  ->  Codex (via 127.0.0.1:10001) / Claude Code are ready to use
+Switch provider  ->  Codex (via 127.0.0.1:10001) is ready to use
+                     (Claude Code gets blocked upstream with 11128, see above)
 ```
 
 Field-by-field setup, verification and troubleshooting: [docs/codex-integration.md](docs/codex-integration.md).
@@ -262,6 +285,7 @@ Any other OpenAI-compatible client (Cherry Studio, Open WebUI, SDKs, scripts) ca
 - [docs/README.md](docs/README.md) — documentation index
 - [docs/FORK-CHANGES.md](docs/FORK-CHANGES.md) — what this fork changes vs. upstream
 - [Reasoning replay handoff](docs/2026-09-18_reasoning-replay-handoff.md) — root cause, fix, real-upstream verification, todos
+- [Upstream 11128 blocks Claude Code](docs/2026-09-23_upstream-11128-claude-code-block.md) — investigation, A/B evidence, conclusion, alternatives
 - [Codex / Claude Code integration](docs/codex-integration.md) — via CC Switch protocol translation
 - Self-checks: `python docs/verify_reasoning_replay.py` (offline), `python docs/probe_reasoning_replay.py replay|models` (live)
 

@@ -1,8 +1,12 @@
 # 思考回放与 Codex 接入 · 交接文档
 
 > 最后更新：2026-09-19（第三轮会话）
-> 状态：思考回放修复已完成并通过真实上游验证；`tokens.json` 接入已补齐；Codex / Claude Code 经 CC Switch 接入（本项目无需改代码）
+> 状态：思考回放修复已完成并通过真实上游验证；`tokens.json` 接入已补齐；Codex 经 CC Switch 接入（本项目无需改代码）
 > 相关：[Codex 接入说明](codex-integration.md) ｜ [文档索引](README.md)
+>
+> ⚠️ **2026-09-23 更正**：本文写作时「Claude Code 也能接」的结论**已作废** —— 上游改为按请求内容
+> 识别客户端，Claude Code 的系统提示词会命中 `code 11128`（请求被安全策略拦截）。见
+> [2026-09-23_upstream-11128-claude-code-block.md](2026-09-23_upstream-11128-claude-code-block.md)。
 
 ## 一句话结论
 
@@ -486,6 +490,8 @@ CLI 直连 chat_completion(echo=True)              -> 仍实时打印，返回�
   启动本项目（`.\start.ps1`）→ 在 CC Switch 新增 `apiFormat = openai_chat` 的 provider
   （base_url = `http://127.0.0.1:8000/v1`）→ 切换供应商 → Codex / Claude Code 即可使用。
   字段填法与排错见 `docs/codex-integration.md`。
+  ⚠️ 2026-09-23 更正：**Claude Code 这条路已不可用**（上游按内容拦 11128，见文首更正与
+  [专门文档](2026-09-23_upstream-11128-claude-code-block.md)）；Codex 仍可用。
 
 **~~P1 — 可观测性~~（已完成，2026-09-19）**
 
