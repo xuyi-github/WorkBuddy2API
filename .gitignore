@@ -1,5 +1,6 @@
 # Secrets — never commit real tokens
 tokens.json
+apikey.local
 
 # Node
 node_modules/

@@ -4,8 +4,9 @@
   一键启动 WorkBuddy2API（Windows）。
 
 .DESCRIPTION
-  检查 Python 与依赖 → 预检 token → 启动 uvicorn。
+  检查 Python 与依赖 → 预检 token → 兜底 API_KEY → 启动 uvicorn。
   token 来源：CODEBUDDY_AUTH_TOKEN 环境变量，或项目根目录的 tokens.json。
+  API_KEY 来源：环境变量，或项目根目录 apikey.local（文件不存在则自动生成一个随机 key 写入）。
 
 .EXAMPLE
   .\start.ps1
@@ -62,7 +63,29 @@ if ($LASTEXITCODE -ne 0) {
     Ok 'token 加载成功'
 }
 
-# ── 4. 启动 ───────────────────────────────────────────────────────────────
+# ── 4. 兜底 API_KEY ───────────────────────────────────────────────────────
+# 优先级：环境变量 API_KEY > 项目根目录 apikey.local > 自动生成并写入 apikey.local
+$apiKeyFile = Join-Path $PSScriptRoot 'apikey.local'
+if ($env:API_KEY) {
+    Ok 'API_KEY 来自环境变量'
+    Write-Host '    （环境变量优先，apikey.local 会被忽略；想改用它先执行 Remove-Item Env:API_KEY）' -ForegroundColor DarkGray
+} else {
+    if (Test-Path -LiteralPath $apiKeyFile) {
+        # 去 BOM / 换行，避免把不可见字符带进 HTTP header
+        $env:API_KEY = ([IO.File]::ReadAllText($apiKeyFile)).Trim().TrimStart([char]0xFEFF)
+    }
+    if ($env:API_KEY) {
+        Ok 'API_KEY 来自 apikey.local'
+    } else {
+        $env:API_KEY = 'sk-wb-' + [guid]::NewGuid().ToString('N')
+        [IO.File]::WriteAllText($apiKeyFile, $env:API_KEY, (New-Object System.Text.UTF8Encoding($false)))
+        Ok '已生成随机 API_KEY 并写入 apikey.local'
+    }
+}
+Write-Host "    API_KEY: $($env:API_KEY)" -ForegroundColor DarkGray
+Write-Host '    （CC Switch 里该 provider 的 apiKey 填同一个值；改 key 后需重启服务）' -ForegroundColor DarkGray
+
+# ── 5. 启动 ───────────────────────────────────────────────────────────────
 $env:PORT = "$Port"
 Write-Host ''
 Ok "启动中：http://127.0.0.1:$Port"

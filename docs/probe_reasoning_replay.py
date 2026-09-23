@@ -4,12 +4,14 @@
 子命令：
 
   replay  思考回放 A/B 对比 —— 验证历史 reasoning_content 是否真的进入底座上下文
-  models  扫描 KNOWN_CHAT_MODELS 在上游的可用性
+  models  扫描模型可用性（--scope 选扫描范围）
 
 用法::
 
     python docs/probe_reasoning_replay.py replay
-    python docs/probe_reasoning_replay.py models
+    python docs/probe_reasoning_replay.py models                  # 只扫 KNOWN_CHAT_MODELS
+    python docs/probe_reasoning_replay.py models --scope catalog  # 扫「上游目录有、清单里没有」的候选
+    python docs/probe_reasoning_replay.py models --scope all --probe-thinking
 
 退出码：replay 通过为 0，未通过为 1；models 始终为 0，仅报告结果。
 """
@@ -27,7 +29,8 @@ import codebuddy_direct_api as m  # noqa: E402
 SECRET = "ZEBRA-9173"
 
 # 明确收费的模型默认跳过，避免产生费用
-PAID_MODELS = {"hy3-preview-agent"}
+# default-1.1 / default-1.2 是客户端目录里的 Claude-3.7 / 4.0-Sonnet 转售档，单价最高
+PAID_MODELS = {"hy3-preview-agent", "default-1.1", "default-1.2"}
 
 
 def _client() -> m.ApiClient:
@@ -118,44 +121,116 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 1
 
 
+def _extract_error(raw: str) -> str:
+    """从响应体里抠出上游错误信息（非 200 的 JSON 体，或 SSE 里的错误事件）。"""
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("error"):
+            err = obj["error"]
+            return str(err.get("message") if isinstance(err, dict) else err)[:200]
+        if obj.get("msg") or obj.get("displayMsg"):
+            display = obj.get("displayMsg") or {}
+            detail = display.get("zh") if isinstance(display, dict) else display
+            return str(obj.get("msg") or detail)[:200]
+    return raw.strip()[:120]
+
+
+def _catalog_ids(client: m.ApiClient) -> set[str]:
+    """上游 /v3/config 目录里的全部模型 id。"""
+    return {c.get("id", "") for c in m.fetch_catalog(client) if c.get("id")}
+
+
+def _probe(client: m.ApiClient, model: str,
+           effort: str | None = None) -> tuple[bool, str, str]:
+    """单次探测，返回 (是否可用, 失败说明, 收到的思考文本)。"""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.0,
+        "max_tokens": 64 if effort else 8,
+        "stream": True,
+    }
+    if effort:
+        payload["reasoning_effort"] = m.THINKING_LEVELS[effort]
+    try:
+        status, raw = _post(client, payload)
+    except Exception as exc:  # noqa: BLE001
+        return False, "EXC " + str(exc), ""
+    if status != 200:
+        return False, "http={} {}".format(status, _extract_error(raw)), ""
+    content, reasoning, _ = _parse_sse(raw)
+    if not content and not reasoning:
+        return False, "空响应 {}".format(_extract_error(raw)), ""
+    return True, "", reasoning
+
+
+def _resolve_targets(client: m.ApiClient, scope: str) -> set[str]:
+    """按 scope 决定要探测哪些模型。"""
+    known = set(m.KNOWN_CHAT_MODELS)
+    if scope == "known":
+        return known
+    # 目录里减掉已收录的全部模型（含生图模型），剩下的才是「找漏」候选
+    candidates = _catalog_ids(client) - set(m.ALL_SUPPORTED_MODELS)
+    return candidates if scope == "catalog" else (candidates | known)
+
+
 def cmd_models(args: argparse.Namespace) -> int:
-    """扫描模型可用性；默认跳过收费模型。"""
+    """扫描模型可用性；默认跳过收费模型。
+
+    scope=catalog 用来给手工清单「找漏」：把上游目录里尚未收录的候选逐个实测，
+    通过的才值得补进 KNOWN_CHAT_MODELS。
+    """
     client = _client()
-    usable, unavailable, skipped = [], [], []
-    for model in sorted(m.KNOWN_CHAT_MODELS):
+    try:
+        targets = _resolve_targets(client, args.scope)
+    except Exception as exc:  # noqa: BLE001
+        print("[!] 读取上游模型目录失败: {}".format(exc))
+        return 1
+
+    usable, unavailable, skipped, thinking = [], [], [], []
+    for model in sorted(targets):
         if model in PAID_MODELS and not args.include_paid:
             skipped.append(model)
-            print("{:26s} SKIP  收费模型".format(model))
+            print("{:32s} SKIP  收费模型".format(model))
             continue
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "temperature": 0.0,
-            "max_tokens": 8,
-            "stream": True,
-        }
-        try:
-            status, raw = _post(client, payload)
-        except Exception as exc:  # noqa: BLE001
-            unavailable.append((model, "EXC " + str(exc)))
-            print("{:26s} EXC   {}".format(model, exc))
-            continue
-        if status == 200:
-            usable.append(model)
-            print("{:26s} OK".format(model))
-        else:
-            try:
-                err = json.loads(raw)
-                detail = err.get("msg") or err.get("displayMsg", {}).get("zh") or raw[:100]
-            except json.JSONDecodeError:
-                detail = raw[:100]
+
+        ok, detail, _ = _probe(client, model)
+        if not ok:
             unavailable.append((model, detail))
-            print("{:26s} FAIL  http={} {}".format(model, status, detail))
+            print("{:32s} FAIL  {}".format(model, detail))
+            continue
+
+        usable.append(model)
+        note = ""
+        if args.probe_thinking:
+            ok2, detail2, reasoning = _probe(client, model, "low")
+            if not ok2:
+                note = "thinking 探测失败: {}".format(detail2)
+            elif reasoning:
+                thinking.append(model)
+                note = "thinking ✓"
+            else:
+                note = "thinking -"
+        print("{:32s} OK    {}".format(model, note))
 
     print("=" * 64)
     print("可用 {} / 不可用 {} / 跳过 {}".format(len(usable), len(unavailable), len(skipped)))
     for model, detail in unavailable:
         print("  x {} -> {}".format(model, detail))
+    if thinking:
+        print("reasoning_content 实测非空 {} 个:".format(len(thinking)))
+        for model in thinking:
+            print("  + {}".format(model))
     return 0
 
 
@@ -169,12 +244,19 @@ def main() -> int:
     p_replay.set_defaults(func=cmd_replay)
 
     p_models = sub.add_parser("models", help="扫描模型可用性")
+    p_models.add_argument(
+        "--scope", choices=("known", "catalog", "all"), default="known",
+        help="known=已收录清单（默认）/ catalog=上游有但未收录的候选 / all=两者",
+    )
+    p_models.add_argument("--probe-thinking", action="store_true",
+                          help="对可用模型补一次 reasoning_effort=low 的调用，判断是否真出思考")
     p_models.add_argument("--include-paid", action="store_true", help="包含收费模型")
     p_models.set_defaults(func=cmd_models)
 
     # 不传子命令时默认执行 replay
     parser.set_defaults(func=cmd_replay, model="deepseek-v3",
-                        max_tokens=256, include_paid=False)
+                        max_tokens=256, include_paid=False,
+                        scope="known", probe_thinking=False)
     args = parser.parse_args()
     return args.func(args)
 

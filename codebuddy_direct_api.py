@@ -95,20 +95,29 @@ TOKENS_FILE = os.environ.get(
 
 # ── Thinking Level Model Map ───────────────────────────────────────────────
 # 哪些模型支持 reasoning_effort 参数（经 /v2/chat/completions 实测验证）
+# 2026-09-23 复测：新增 6 个实测 reasoning_content 非空的模型（deepseek-r1-0528-lkeap /
+# deepseek-v3-1-lkeap / glm-5.0-turbo / glm-5v-turbo / hy3 / minimax-m2.7）与 auto。
+# deepseek-v3、deepseek-v3-0324 在 low 深度下未观察到 reasoning_content，但入参被上游
+# 接受（HTTP 200），无法据此否定，保留原判定。
 THINKING_CAPABLE_MODELS = {
     # DeepSeek 系列
     "deepseek-v3", "deepseek-v3-0324",
-    "deepseek-r1", "deepseek-v4-flash",
-    "deepseek-v4-pro", "deepseek-v3-2-volc",
+    "deepseek-r1", "deepseek-r1-0528-lkeap",
+    "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v3-2-volc",
+    "deepseek-v3-1-lkeap",
     # GLM 系列
-    "glm-5.1", "glm-5.2",
+    "glm-5.1", "glm-5.2", "glm-5.0-turbo", "glm-5v-turbo",
     # Kimi 系列（实测支持 reasoning_effort，默认开启思考）
     "kimi-k2.5", "kimi-k2.6", "kimi-k2.7", "kimi-k3-1",
     # HY 系列
-    "hy3-preview", "hy3-preview-agent",
+    "hy3", "hy3-preview", "hy3-preview-agent",
     "hy4-preview",
     # Hunyuan
     "hunyuan-2.0-thinking",
+    # MiniMax
+    "minimax-m2.7",
+    # 上游 Auto 路由
+    "auto",
 }
 
 # reasoning_effort 可用值映射
@@ -1342,7 +1351,14 @@ def interactive_chat(client: ApiClient, model: str, thinking_level: str | None):
 # 已在 /v2/chat/completions 实测验证可用
 # 2026-09-18 移除上游已下架（返回 model service info not found）的 4 个模型：
 # deepseek-r1-0528 / deepseek-v3-1 / glm-4.7 / glm-5.0
+# 2026-09-23 全量复测（docs/probe_reasoning_replay.py models --probe-thinking）：
+#   本清单 24/24 可用，无一失效；反倒是上游 /v3/config 目录（客户端模型选择器读的
+#   就是这份）陈旧——未收录的 21 个候选里 17 个已下架（glm-4.6/4.6v、glm-5.0、
+#   kimi-k2-thinking、minimax-m2.5、default-1.1/1.2 等），3 个是代码补全类非对话
+#   模型（codewise-*，对聊天请求只回空代码块），只有 auto 是真正的对话入口。
 KNOWN_CHAT_MODELS = {
+    # 上游 Auto 档：由上游路由到具体模型（实测落到混元，会出思考），非独立模型
+    "auto",
     # DeepSeek 系列
     "deepseek-v3", "deepseek-v3-0324",
     "deepseek-v3-0324-lkeap", "deepseek-v3-1-lkeap",
@@ -1381,11 +1397,14 @@ FREE_MODELS = {
 
 
 # ── Model Listing ──────────────────────────────────────────────────────────
-def list_models(client: ApiClient):
-    """获取并显示可用模型列表。"""
+def fetch_catalog(client: ApiClient) -> list[dict]:
+    """读取上游 /v3/config 的模型目录（WorkBuddy 客户端模型选择器用的同一份数据）。
 
-    known_working = KNOWN_CHAT_MODELS
+    注意：目录是「客户端可见模型」清单，不等于「API 可调用模型」清单——里面混有
+    已下架或非对话用途（补全 / NES）的条目，可用性需另行实测。
 
+    返回 [{"id": str, "name": str, ...}]；失败抛 RuntimeError。
+    """
     headers = client._build_headers()
     headers.update({
         "X-Product": "SaaS",
@@ -1401,11 +1420,22 @@ def list_models(client: ApiClient):
     conn.close()
 
     if resp.status != 200:
-        print(f"[!] 获取模型列表失败: {resp.status}", file=sys.stderr)
-        return
+        raise RuntimeError(f"获取上游模型目录失败: HTTP {resp.status}")
 
     data = json.loads(body)
-    models = data.get("data", data).get("models", [])
+    return data.get("data", data).get("models", []) or []
+
+
+def list_models(client: ApiClient):
+    """获取并显示可用模型列表。"""
+
+    known_working = KNOWN_CHAT_MODELS
+
+    try:
+        models = fetch_catalog(client)
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] {e}", file=sys.stderr)
+        return
 
     print(f"\n{'='*80}")
     print(f"  CodeBuddy 可用模型列表 (共 {len(models)} 个)")
